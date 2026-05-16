@@ -406,6 +406,7 @@ ppp --pull-iplist ./cn.txt
 | `openppp2 telemetry level 0\|1\|2\|3` | 设置遥测 verbosity 阈值 |
 | `openppp2 telemetry all` | 启用所有控制台遥测过滤器 |
 | `openppp2 telemetry quiet` | 禁用所有控制台遥测过滤器 |
+| `openppp2 telemetry clear` | 清空遥测事件缓冲区（TUI 右侧面板） |
 | *（其他任意输入）* | 作为 shell 命令执行，将输出捕获到命令区 |
 
 说明：
@@ -456,6 +457,7 @@ ppp --pull-iplist ./cn.txt
 | `openppp2 telemetry level 3` | Info + Verb + Debug + Trace（verbosity 阈值 3） |
 | `openppp2 telemetry all` | 启用所有控制台遥测过滤器（日志 + 指标 + span） |
 | `openppp2 telemetry quiet` | 禁用所有控制台遥测过滤器（日志 + 指标 + span） |
+| `openppp2 telemetry clear` | 清空遥测事件缓冲区（TUI 右侧面板中显示） |
 
 `telemetry` 命名空间必须使用 `openppp2` 前缀 —— 裸输入 `telemetry` 会作为 shell 命令执行。
 底层遥测子系统架构和 `appsettings.json` 配置项详见 `OTEL_DESIGN_CN.md`。

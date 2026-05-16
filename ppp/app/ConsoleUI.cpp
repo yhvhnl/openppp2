@@ -38,6 +38,55 @@
 namespace ppp::app {
 
 // ---------------------------------------------------------------------------
+// TUI-aware telemetry sink — redirects telemetry stderr output into the
+// ConsoleUI event ring buffer when the TUI is active.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Console sink callback installed into the telemetry backend.
+ *
+ * Called from the TelemetryBackend worker thread for every formatted
+ * telemetry line that would otherwise be written to stderr.
+ */
+static void TelemetryToConsoleUI(const char* line) noexcept {
+    // The telemetry backend loads the sink function pointer without taking the
+    // ConsoleUI lifecycle lock.  Stop() clears running_ before unregistering the
+    // sink, so this guard closes the small race where a backend worker may have
+    // already loaded this callback while the TUI is tearing down.
+    if (!ConsoleUI::IsRunning()) {
+        return;
+    }
+
+    ConsoleUI::GetInstance().AppendTelemetryEventLine(line);
+}
+
+/**
+ * @brief Strips ANSI escape sequences from a string.
+ *
+ * Removes all occurrences of ESC[...m (SGR) sequences so that the
+ * resulting string contains only printable characters suitable for
+ * FitWidth() display-width calculation.
+ */
+static ppp::string StripAnsiEscapes(const ppp::string& s) noexcept {
+    ppp::string result;
+    result.reserve(s.size());
+    bool in_escape = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_escape) {
+            if (('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')) {
+                in_escape = false;
+            }
+        } else if (c == '\x1b') {
+            in_escape = true;
+        } else {
+            result.push_back(c);
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // UTF-8 box-drawing character constants (each is 3 bytes, 1 display column)
 // ---------------------------------------------------------------------------
 
@@ -578,6 +627,11 @@ bool ConsoleUI::Start() noexcept {
     }
 
     AppendLine("Console UI started. Type 'openppp2 help' for commands.");
+
+    // Redirect telemetry console output into the TUI event buffer instead
+    // of stderr.  The file sink is unaffected.
+    ppp::telemetry::SetConsoleSink(&TelemetryToConsoleUI);
+
     return true;
 }
 
@@ -585,6 +639,11 @@ void ConsoleUI::Stop() noexcept {
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+
+    // Unregister the telemetry console sink so that the backend reverts to
+    // stderr output after the TUI tears down.  Must happen before the render
+    // thread joins, to avoid a use-after-teardown race.
+    ppp::telemetry::SetConsoleSink(nullptr);
 
     // Wake the render thread so it exits its condition-variable wait immediately
     // rather than blocking up to the full 100 ms timeout.
@@ -720,6 +779,61 @@ void ConsoleUI::SetTelemetryLines(const ppp::vector<ppp::string>& lines) noexcep
     {
         std::lock_guard<std::mutex> scope(lock_);
         telemetry_lines_ = lines;
+    }
+    MarkDirty();
+}
+
+bool ConsoleUI::IsRunning() noexcept {
+    return GetInstance().running_.load(std::memory_order_acquire);
+}
+
+void ConsoleUI::AppendTelemetryEventLine(const char* line) noexcept {
+    if (!line || '\0' == line[0]) {
+        return;
+    }
+
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    ppp::string clean = StripAnsiEscapes(ppp::string(line));
+
+    // Strip trailing newline / carriage-return
+    while (!clean.empty() && ('\n' == clean.back() || '\r' == clean.back())) {
+        clean.pop_back();
+    }
+    if (clean.empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> scope(lock_);
+        telemetry_event_lines_.push_back(std::move(clean));
+        while (kMaxTelemetryEventLines < static_cast<int>(telemetry_event_lines_.size())) {
+            telemetry_event_lines_.pop_front();
+        }
+    }
+    // Telemetry can be high-volume.  Always set dirty_ so the render loop will
+    // repaint on its regular 100 ms cadence, but throttle CV notifications to
+    // avoid one wakeup/futex per event during bursts.
+    dirty_.store(true, std::memory_order_release);
+    uint64_t now_ms = ppp::GetTickCount();
+    uint64_t last_ms = last_telemetry_dirty_notify_ms_.load(std::memory_order_acquire);
+    if (now_ms < last_ms || now_ms - last_ms >= kTelemetryDirtyNotifyIntervalMs) {
+        if (last_telemetry_dirty_notify_ms_.compare_exchange_strong(
+                last_ms,
+                now_ms,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            render_cv_.notify_one();
+        }
+    }
+}
+
+void ConsoleUI::ClearTelemetryEventLines() noexcept {
+    {
+        std::lock_guard<std::mutex> scope(lock_);
+        telemetry_event_lines_.clear();
     }
     MarkDirty();
 }
@@ -924,6 +1038,7 @@ void ConsoleUI::RenderFrame() noexcept {
     // -----------------------------------------------------------------------
     ppp::vector<ppp::string> info_snap;
     ppp::vector<ppp::string> telemetry_snap;
+    std::deque<ppp::string>  tele_event_snap;
     int                      info_scroll;
     std::deque<ppp::string>  cmd_snap;
     int                      cmd_scroll;
@@ -932,22 +1047,24 @@ void ConsoleUI::RenderFrame() noexcept {
 
     {
         std::lock_guard<std::mutex> scope(lock_);
-        info_snap      = info_lines_;
-        telemetry_snap = telemetry_lines_;
-        info_scroll    = info_scroll_;
-        cmd_snap       = cmd_lines_;
-        cmd_scroll     = cmd_scroll_;
-        input_snap     = input_buffer_;
-        cursor_snap    = input_cursor_;
+        info_snap       = info_lines_;
+        telemetry_snap  = telemetry_lines_;
+        tele_event_snap = telemetry_event_lines_;
+        info_scroll     = info_scroll_;
+        cmd_snap        = cmd_lines_;
+        cmd_scroll      = cmd_scroll_;
+        input_snap      = input_buffer_;
+        cursor_snap     = input_cursor_;
     }
 
     // -----------------------------------------------------------------------
     // 2c. Dynamic split: allocate middle rows between info and cmd based
     //     on their actual content sizes, avoiding one panel starving the other.
     // -----------------------------------------------------------------------
-    int info_total  = static_cast<int>(info_snap.size());
-    int tele_total  = static_cast<int>(telemetry_snap.size());
-    int cmd_total   = static_cast<int>(cmd_snap.size());
+    int info_total      = static_cast<int>(info_snap.size());
+    int tele_total      = static_cast<int>(telemetry_snap.size());
+    int tele_event_total = static_cast<int>(tele_event_snap.size());
+    int cmd_total       = static_cast<int>(cmd_snap.size());
 
     int info_h, cmd_h;
 
@@ -1023,10 +1140,11 @@ void ConsoleUI::RenderFrame() noexcept {
     {
         int total       = static_cast<int>(info_snap.size());
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = ((width - 2) >= kTwoColMinInner) && (tele_total > 0);
+        const bool two_col = ((width - 2) >= kTwoColMinInner)
+                          && (tele_total > 0 || tele_event_total > 0);
         // In two-column mode only the left column scrolls; right column is static.
-        // In single-column mode info + telemetry are combined and scroll together.
-        int combined    = two_col ? total : (total + tele_total);
+        // In single-column mode info + telemetry status + events are combined.
+        int combined    = two_col ? total : (total + tele_total + tele_event_total);
         int max_scroll  = std::max(0, combined - info_h);
         if (info_scroll > max_scroll) {
             info_scroll = max_scroll;
@@ -1122,9 +1240,10 @@ void ConsoleUI::RenderFrame() noexcept {
     frame += BoxSepRow(width);
 
     // --- Info section (info_h rows) ---
-    // Two-column mode when inner width >= 96 display columns.
-    // Left column shows lines [0..mid), right column shows [mid..end).
-    // This doubles the visible info capacity on wide terminals.
+    // Two-column mode when inner width >= 76 display columns and there is
+    // any telemetry content (status snapshot or event stream).
+    // Left column shows environment info, right column shows telemetry
+    // status lines at the top with recent event lines filling the rest.
     {
         int total  = static_cast<int>(info_snap.size());
         int start  = info_scroll;  // 0 = top of info content
@@ -1132,44 +1251,63 @@ void ConsoleUI::RenderFrame() noexcept {
         // Minimum inner width needed for two-column mode:
         // Each column needs at least 40 chars of content + 1 separator + 2 borders.
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = (inner >= kTwoColMinInner) && (tele_total > 0);
+        const bool two_col = (inner >= kTwoColMinInner)
+                          && (tele_total > 0 || tele_event_total > 0);
 
         if (two_col) {
             // Left column: environment info from info_snap.
-            // Right column: telemetry lines from telemetry_snap.
-            // ALL rows use BoxSplitRow so the center │ aligns consistently.
+            // Right column: telemetry status snapshot (top) + recent events (bottom).
             int split_col = inner / 2 + 1;  // display column for center │
-            int tele_start = 0;  // telemetry has its own independent content
+
+            // In the right column, status lines come first, then event lines.
+            // If there are more combined lines than info_h, the most recent
+            // event lines are shown (older ones are truncated from the bottom).
+            int right_total = tele_total + tele_event_total;
+            int right_event_start = 0;  // offset within tele_event_snap to start from
+            if (right_total > info_h) {
+                // More content than rows — trim events from the front.
+                int overflow = right_total - info_h;
+                right_event_start = std::min(overflow, tele_event_total);
+            }
 
             for (int i = 0; i < info_h; ++i) {
                 int left_idx = start + i;
-                int right_idx = tele_start + i;
 
                 ppp::string left_text;
                 if (0 <= left_idx && left_idx < total) {
                     left_text = " " + info_snap[static_cast<std::size_t>(left_idx)];
                 }
 
+                // Build right column line: status first, then events.
                 ppp::string right_text;
-                if (0 <= right_idx && right_idx < tele_total) {
-                    right_text = " " + telemetry_snap[static_cast<std::size_t>(right_idx)];
+                if (i < tele_total) {
+                    right_text = " " + telemetry_snap[static_cast<std::size_t>(i)];
+                } else {
+                    int event_idx = right_event_start + (i - tele_total);
+                    if (event_idx >= 0 && event_idx < tele_event_total) {
+                        right_text = " " + tele_event_snap[static_cast<std::size_t>(event_idx)];
+                    }
                 }
 
                 frame += BoxSplitRow(left_text, right_text, width, split_col);
             }
         } else {
-            // Single column: info lines, then telemetry lines appended.
+            // Single column: info lines, then telemetry status, then event lines.
             for (int i = 0; i < info_h; ++i) {
                 int idx = start + i;
                 if (0 <= idx && idx < total) {
                     frame += BoxContentRow(" " + info_snap[static_cast<std::size_t>(idx)], width);
                 } else {
-                    // After info lines, show telemetry lines.
                     int tele_idx = idx - total;
                     if (tele_idx >= 0 && tele_idx < tele_total) {
                         frame += BoxContentRow(" " + telemetry_snap[static_cast<std::size_t>(tele_idx)], width);
                     } else {
-                        frame += BoxContentRow("", width);
+                        int event_idx = tele_idx - tele_total;
+                        if (event_idx >= 0 && event_idx < tele_event_total) {
+                            frame += BoxContentRow(" " + tele_event_snap[static_cast<std::size_t>(event_idx)], width);
+                        } else {
+                            frame += BoxContentRow("", width);
+                        }
                     }
                 }
             }
@@ -1533,11 +1671,12 @@ void ConsoleUI::ScrollInfoBy(int delta) noexcept {
     int inner = w - 2;
     {
         std::lock_guard<std::mutex> scope(lock_);
-        int total = static_cast<int>(info_lines_.size());
-        int tele  = static_cast<int>(telemetry_lines_.size());
+        int total  = static_cast<int>(info_lines_.size());
+        int tele   = static_cast<int>(telemetry_lines_.size());
+        int events = static_cast<int>(telemetry_event_lines_.size());
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = (inner >= kTwoColMinInner) && (tele > 0);
-        int combined = two_col ? total : (total + tele);
+        const bool two_col = (inner >= kTwoColMinInner) && (tele > 0 || events > 0);
+        int combined = two_col ? total : (total + tele + events);
 
         int next = info_scroll_ + delta;
         if (0 > next) {
@@ -1660,7 +1799,7 @@ void ConsoleUI::ExecuteCommand(const ppp::string& command_line) noexcept {
             AppendLine("  openppp2 exit             - Exit the application");
             AppendLine("  openppp2 info             - Print full runtime environment snapshot");
             AppendLine("  openppp2 clear            - Clear command output section");
-            AppendLine("  openppp2 telemetry ...    - Telemetry filter controls (status/help/log/metric/span/level/all/quiet)");
+            AppendLine("  openppp2 telemetry ...    - Telemetry filter controls (status/help/log/metric/span/level/all/quiet/clear)");
             AppendLine("  <shell command>           - Execute a system shell command");
             AppendLine("");
             AppendLine("All typed characters are normal input; no single-key hotkeys.");
@@ -1748,6 +1887,7 @@ void ConsoleUI::ExecuteCommand(const ppp::string& command_line) noexcept {
                 AppendLine("  openppp2 telemetry level 0|1|2|3      - Set telemetry verbosity threshold");
                 AppendLine("  openppp2 telemetry all                - Enable all telemetry filters");
                 AppendLine("  openppp2 telemetry quiet              - Disable all telemetry filters");
+                AppendLine("  openppp2 telemetry clear              - Clear telemetry event buffer");
                 return;
             }
 
@@ -1764,6 +1904,12 @@ void ConsoleUI::ExecuteCommand(const ppp::string& command_line) noexcept {
                 ppp::telemetry::SetConsoleMetricEnabled(false);
                 ppp::telemetry::SetConsoleSpanEnabled(false);
                 emit_state();
+                return;
+            }
+
+            if ("clear" == tel_rest) {
+                ClearTelemetryEventLines();
+                AppendLine("Telemetry event buffer cleared.");
                 return;
             }
 

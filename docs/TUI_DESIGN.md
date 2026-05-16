@@ -192,6 +192,7 @@ terminal themes with low contrast.
 | `openppp2 telemetry level 0\|1\|2\|3`        | Set telemetry verbosity threshold (0=Info … 3=Trace) |
 | `openppp2 telemetry all`     | Enable all console telemetry filters (log + metric + span) |
 | `openppp2 telemetry quiet`   | Disable all console telemetry filters |
+| `openppp2 telemetry clear`   | Clear telemetry event buffer |
 | *(any other input)*   | Execute as shell command, capture output         |
 
 Bare commands such as `help`, `restart`, `exit`, `clear`, and `status` are not mapped to
@@ -229,6 +230,7 @@ built-in handlers. They are executed as shell commands.
 | `openppp2 telemetry level 3` | Verbosity threshold: Info + Verb + Debug + Trace (all) |
 | `openppp2 telemetry all` | Enables all console telemetry filters (log + metric + span) |
 | `openppp2 telemetry quiet` | Disables all console telemetry filters (log + metric + span) |
+| `openppp2 telemetry clear` | Clears telemetry event buffer (TUI right panel) |
 
 > **Note:** The `log`, `metric`, and `span` commands only toggle console/local output
 > filters. They do **not** change global telemetry runtime gates (`telemetry.enabled`,

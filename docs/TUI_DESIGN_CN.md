@@ -151,6 +151,7 @@ graph TD
 | `openppp2 telemetry level 0\|1\|2\|3`        | 设置遥测 verbosity 阈值（0=仅 Info … 3=全部） |
 | `openppp2 telemetry all`     | 启用所有控制台遥测过滤器 |
 | `openppp2 telemetry quiet`   | 禁用所有控制台遥测过滤器 |
+| `openppp2 telemetry clear`   | 清空遥测事件缓冲区 |
 | *(其他任意输入)*      | 作为 shell 命令执行，捕获输出 |
 
 `help`、`restart`、`exit`、`clear`、`status` 等裸命令不会映射为内置命令，会按 shell 命令执行。
@@ -184,6 +185,7 @@ graph TD
 | `openppp2 telemetry level 3` | Info + Verb + Debug + Trace（verbosity 阈值 3） |
 | `openppp2 telemetry all` | 启用所有控制台遥测过滤器（日志 + 指标 + span） |
 | `openppp2 telemetry quiet` | 禁用所有控制台遥测过滤器（日志 + 指标 + span） |
+| `openppp2 telemetry clear` | 清空遥测事件缓冲区（TUI 右侧面板） |
 
 `telemetry` 命名空间必须使用 `openppp2` 前缀 —— 裸输入 `telemetry` 会作为 shell 命令执行。
 
