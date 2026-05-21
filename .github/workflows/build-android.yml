@@ -155,12 +155,12 @@ jobs:
 
           mkdir -p android/android/keystore
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/android/keystore/yav-release-key.p12
-          cat > android/android/keystore/yav-release-key.properties <<EOF
-storeFile=keystore/yav-release-key.p12
-storePassword=${ANDROID_KEYSTORE_PASSWORD}
-keyAlias=${ANDROID_KEY_ALIAS}
-keyPassword=${ANDROID_KEY_PASSWORD}
-EOF
+          {
+            echo "storeFile=keystore/yav-release-key.p12"
+            echo "storePassword=${ANDROID_KEYSTORE_PASSWORD}"
+            echo "keyAlias=${ANDROID_KEY_ALIAS}"
+            echo "keyPassword=${ANDROID_KEY_PASSWORD}"
+          } > android/android/keystore/yav-release-key.properties
 
       - name: Build release APK
         run: |
