@@ -233,7 +233,9 @@ jobs:
       - name: Build openppp2
         shell: bash
         run: |
-          TP="${{ github.workspace }}/third-party"
+          # Inside a Debian container $GITHUB_WORKSPACE maps to /__w/...
+          # while ${{ github.workspace }} resolves to the host path.
+          TP="$GITHUB_WORKSPACE/third-party"
           mkdir -p build && cd build
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
