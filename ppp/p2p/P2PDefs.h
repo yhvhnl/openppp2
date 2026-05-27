@@ -12,6 +12,7 @@
  */
 
 #include <ppp/stdafx.h>
+#include <ppp/Int128.h>
 
 namespace ppp {
     namespace p2p {

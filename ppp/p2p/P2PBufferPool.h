@@ -18,6 +18,7 @@
 #include <ppp/p2p/P2PDefs.h>
 #include <boost/lockfree/queue.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <cstring>
@@ -97,6 +98,7 @@ namespace ppp {
              */
             explicit P2PBufferPool(int count = DEFAULT_BUFFER_POOL_COUNT) noexcept
                 : total_(std::clamp(count, 1, 1024))
+                , available_(total_)
                 , free_list_(static_cast<unsigned int>(total_)) {
                 storage_.reset(static_cast<uint8_t*>(
                     std::malloc(static_cast<size_t>(total_) * P2P_BUFFER_SIZE)));
@@ -126,6 +128,7 @@ namespace ppp {
             Buffer Acquire() noexcept {
                 uint8_t* ptr = nullptr;
                 if (free_list_.pop(ptr)) {
+                    available_.fetch_sub(1, std::memory_order_relaxed);
                     return Buffer(ptr, this);
                 }
                 // Pool exhausted — return null buffer (fail closed, no malloc).
@@ -136,7 +139,7 @@ namespace ppp {
              * @brief Returns the number of buffers currently in the free list.
              */
             int Available() const noexcept {
-                return static_cast<int>(free_list_.read_available());
+                return available_.load(std::memory_order_relaxed);
             }
 
             /**
@@ -158,11 +161,13 @@ namespace ppp {
                 uint8_t* end  = base + static_cast<size_t>(total_) * P2P_BUFFER_SIZE;
                 if (ptr >= base && ptr < end) {
                     free_list_.push(ptr);
+                    available_.fetch_add(1, std::memory_order_relaxed);
                 }
                 // If not pool-owned (should not happen), silently ignore.
             }
 
             int                                         total_;         ///< Number of pre-allocated buffers.
+            std::atomic<int>                            available_;     ///< Current number of buffers in free list.
             std::unique_ptr<uint8_t, decltype(&std::free)> storage_{nullptr, std::free}; ///< Contiguous buffer storage.
             boost::lockfree::queue<uint8_t*>            free_list_;     ///< Lock-free free list.
         };

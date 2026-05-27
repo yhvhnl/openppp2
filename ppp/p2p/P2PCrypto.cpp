@@ -16,6 +16,14 @@
 #include <openssl/params.h>
 #include <cstring>
 
+// Suppress OpenSSL 3.0 deprecation warnings for HMAC_* functions.
+// The project still targets OpenSSL 1.1.1+ compatibility; migrating
+// to EVP_MAC is deferred until the minimum OpenSSL version is raised.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)  // deprecated in OpenSSL 3.0
+#endif
+
 namespace ppp {
     namespace p2p {
 
@@ -378,3 +386,7 @@ namespace ppp {
 
     }
 }
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif

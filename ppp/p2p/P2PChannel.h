@@ -129,6 +129,17 @@ namespace ppp {
                                       uint8_t* out_buf, int buf_cap,
                                       int& out_len) const noexcept;
 
+            /**
+             * @brief Verifies a Tier-1 token using the unified token binding (C1).
+             *
+             * Reconstructs the HMAC input from the header (with token zeroed)
+             * and the stored offer_token, then verifies the token field.
+             *
+             * @param[in] header Parsed Tier-1 header containing the token to verify.
+             * @return true if the token is valid.
+             */
+            bool VerifyTier1Token(const P2PTier1Header& header) noexcept;
+
         private:
             boost::asio::io_context&                    io_ctx_;
             std::shared_ptr<ISocketProtector>           protector_;
