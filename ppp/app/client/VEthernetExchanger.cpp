@@ -134,6 +134,18 @@ namespace ppp {
                     request.ClientIPv4Req = ipv4_req;
                 }
 
+                if (configuration->p2p.enabled) {
+                    request.P2P.enabled = true;
+                    request.P2P.mode = configuration->p2p.mode;
+                    request.P2P.action = "register";
+                    if (switcher) {
+                        std::shared_ptr<ppp::tap::ITap> tap = switcher->GetTap();
+                        if (NULLPTR != tap) {
+                            request.P2P.virtual_ip = tap->IPAddress;
+                        }
+                    }
+                }
+
                 InformationEnvelope envelope;
                 envelope.Base.Clear();
                 envelope.Extensions = request;
@@ -402,8 +414,13 @@ namespace ppp {
                 }
 #endif
 
+                ppp::telemetry::Count("client_exchanger.connect.attempt", 1);
+                ppp::telemetry::Log(Level::kInfo, "client_exchanger", "tcp connecting: %s:%d address=%s", hostname.c_str(), remotePort, remoteIP.to_string().c_str());
+
                 bool ok = ppp::coroutines::asio::async_connect(*socket, remoteEP, y);
                 if (!ok) {
+                    ppp::telemetry::Count("client_exchanger.connect.fail.tcp", 1);
+                    ppp::telemetry::Log(Level::kInfo, "client_exchanger", "tcp connect failed: %s:%d address=%s error=%d", hostname.c_str(), remotePort, remoteIP.to_string().c_str(), (int)ppp::diagnostics::ErrorCode::TcpConnectFailed);
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::TcpConnectFailed, VEthernetExchanger::ITransmissionPtr(NULLPTR));
                 }
 
@@ -641,11 +658,20 @@ namespace ppp {
                     ExchangeToConnectingState(); {
                         ITransmissionPtr transmission = OpenTransmission(context, y);
                         if (transmission) {
-                            if (transmission->HandshakeServer(y, GetId(), true) && EchoLanToRemoteExchanger(transmission, y) > -1) {
+                            bool established = transmission->HandshakeServer(y, GetId(), true) && EchoLanToRemoteExchanger(transmission, y) > -1;
+                            if (established) {
                                 transmission_ = transmission;
                                 ExchangeToEstablishState(); {
                                     ppp::telemetry::Count("client_exchanger.connect", 1);
                                     ppp::telemetry::Log(Level::kInfo, "client_exchanger", "exchanger connected");
+#if !defined(_ANDROID) && !defined(_IPHONE)
+                                    if (std::shared_ptr<VEthernetNetworkSwitcher> switcher = switcher_; NULLPTR != switcher) {
+                                        if (!switcher->TryApplyHostedNetworkRoutes()) {
+                                            ppp::telemetry::Log(Level::kInfo, "client_exchanger", "route setup failed after exchanger connected");
+                                            ppp::telemetry::Count("client_exchanger.route_setup.fail", 1);
+                                        }
+                                    }
+#endif
                                     if (!SendRequestedIPv6Configuration(transmission, y)) {
                                         transmission->Dispose();
                                         continue;
@@ -676,8 +702,16 @@ namespace ppp {
                                 }
                                 transmission_.reset();
                             }
+                            else {
+                                ppp::telemetry::Count("client_exchanger.connect.fail.handshake", 1);
+                                ppp::telemetry::Log(Level::kInfo, "client_exchanger", "exchanger handshake failed error=%d", (int)ppp::diagnostics::GetLastErrorCode());
+                            }
 
                             transmission->Dispose();
+                        }
+                        else {
+                            ppp::telemetry::Count("client_exchanger.connect.fail.open_transmission", 1);
+                            ppp::telemetry::Log(Level::kInfo, "client_exchanger", "open transmission failed error=%d", (int)ppp::diagnostics::GetLastErrorCode());
                         }
                     }
                     ExchangeToReconnectingState();
