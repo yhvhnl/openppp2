@@ -12,8 +12,6 @@
 #include <openssl/kdf.h>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
-#include <openssl/core_names.h>
-#include <openssl/params.h>
 #include <cstring>
 
 // Suppress OpenSSL 3.0 deprecation warnings for HMAC_* functions.
