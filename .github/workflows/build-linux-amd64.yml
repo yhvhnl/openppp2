@@ -202,6 +202,7 @@ jobs:
 
       - name: Build Boost
         if: steps.cache-third.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           mkdir -p third-party && cd third-party
           wget -q "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION//./_}.tar.bz2"
@@ -211,6 +212,7 @@ jobs:
 
       - name: Build OpenSSL
         if: steps.cache-third.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           mkdir -p third-party && cd third-party
           wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
@@ -220,6 +222,7 @@ jobs:
 
       - name: Build jemalloc
         if: steps.cache-third.outputs.cache-hit != 'true'
+        shell: bash
         run: |
           mkdir -p third-party && cd third-party
           wget -q "https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/jemalloc-${JEMALLOC_VERSION}.tar.bz2"
@@ -228,6 +231,7 @@ jobs:
           cd jemalloc && ./autogen.sh --with-jemalloc-prefix=je_ && make -j$(nproc)
 
       - name: Build openppp2
+        shell: bash
         run: |
           TP="${{ github.workspace }}/third-party"
           mkdir -p build && cd build
@@ -239,6 +243,7 @@ jobs:
           make -j$(nproc)
 
       - name: Collect artifacts
+        shell: bash
         run: |
           ARTIFACT="openppp2-linux-amd64-debian10.zip"
           ARTIFACT_DIR="artifact"
