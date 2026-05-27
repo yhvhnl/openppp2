@@ -198,7 +198,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/third-party
-          key: linux-amd64-debian10-third-v1-boost${{ env.BOOST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-jemalloc${{ env.JEMALLOC_VERSION }}
+          key: linux-amd64-debian10-third-v2-boost${{ env.BOOST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-jemalloc${{ env.JEMALLOC_VERSION }}
 
       - name: Build Boost
         if: steps.cache-third.outputs.cache-hit != 'true'
