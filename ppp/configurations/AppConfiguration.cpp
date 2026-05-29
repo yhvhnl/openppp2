@@ -2139,14 +2139,14 @@ namespace ppp {
                 ++warnings;
                 ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "security",
                     "Plaintext mode enabled (key.plaintext=true); packets transmitted without encryption");
-                ppp::ConsoleFormat("[security] WARN: plaintext mode enabled (key.plaintext=true) — not suitable for untrusted networks\n");
+                    ppp::ConsoleFormat("[security] WARN: plaintext mode enabled (key.plaintext=true) - not suitable for untrusted networks\n");
             }
 
             /* Summary */
             if (warnings > 0) {
                 ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "security",
-                    "Startup security diagnostics: %d warning(s) — startup continues (non-fatal)", warnings);
-                ppp::ConsoleFormat("[security] Startup security diagnostics: %d warning(s) — startup continues (non-fatal)\n", warnings);
+                    "Startup security diagnostics: %d warning(s) - startup continues (non-fatal)", warnings);
+                ppp::ConsoleFormat("[security] Startup security diagnostics: %d warning(s) - startup continues (non-fatal)\n", warnings);
             }
             else {
                 ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "security",

@@ -3,6 +3,7 @@
 #include <ppp/net/Ipep.h>
 #include <ppp/net/Socket.h>
 #include <ppp/diagnostics/Error.h>
+#include <ppp/diagnostics/Telemetry.h>
 
 #include <ppp/threading/Executors.h>
 #include <ppp/coroutines/asio/asio.h>
@@ -328,6 +329,13 @@ namespace ppp {
 
                     ERROR_CODES err = (ERROR_CODES)connector->ErrorCode;
                     if (err != ERROR_CODES::ERRORS_SUCCESS) {
+                        ppp::telemetry::Count("tcpip.peer_connect.reject.protocol", 1);
+                        ppp::telemetry::Log(ppp::telemetry::Level::kInfo,
+                            "tcpip",
+                            "peer connect rejected: host=%s port=%d protocol_error=%u",
+                            host.c_str(),
+                            port,
+                            static_cast<unsigned int>(connector->ErrorCode));
                         ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SocketConnectFailed);
                         return false;
                     }
