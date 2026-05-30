@@ -123,14 +123,31 @@ namespace ppp {
                     }
                 }
 
-                // Build IPv4 request: default to "auto" mode (no explicit manual tuple detected).
-                // If the configuration has an explicit manual tuple (e.g. from CLI), it could
-                // be set to "manual" with address/gateway/mask.  For now, the minimal safe
-                // path is to always request "auto" so the server assigns from its pool.
+                // Build IPv4 request: when the client has an explicit static IP configuration
+                // (--tun-static or equivalent), send "manual" mode with the configured address
+                // tuple so the server knows not to assign from its pool.  Otherwise request
+                // "auto" for server-side DHCP allocation.
                 {
                     ppp::app::protocol::ClientIPv4Request ipv4_req;
                     ipv4_req.enabled = true;
-                    ipv4_req.mode = "auto";
+
+                    bool is_static = switcher && switcher->StaticMode(NULLPTR);
+                    if (is_static && switcher) {
+                        std::shared_ptr<ppp::tap::ITap> tap = switcher->GetTap();
+                        if (NULLPTR != tap && tap->IPAddress != IPEndPoint::AnyAddress && tap->IPAddress != IPEndPoint::NoneAddress) {
+                            ipv4_req.mode = "manual";
+                            ipv4_req.address = Ipep::ToAddress(tap->IPAddress).to_string();
+                            ipv4_req.gateway = Ipep::ToAddress(tap->GatewayServer).to_string();
+                            ipv4_req.mask = Ipep::ToAddress(tap->SubmaskAddress).to_string();
+                        }
+                        else {
+                            ipv4_req.mode = "auto";
+                        }
+                    }
+                    else {
+                        ipv4_req.mode = "auto";
+                    }
+
                     request.ClientIPv4Req = ipv4_req;
                 }
 
