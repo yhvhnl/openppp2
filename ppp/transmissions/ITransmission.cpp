@@ -436,6 +436,11 @@ namespace ppp {
 
                 /** @brief Frame length upper-bound check (P0-4A): reject in-memory base94 frames exceeding PPP_BUFFER_SIZE. */
                 if (payload_length > PPP_BUFFER_SIZE) {
+                    ppp::telemetry::Log(Level::kInfo,
+                        "transmission",
+                        "base94 frame too large payload_length=%d max=%d in_memory=yes",
+                        payload_length,
+                        PPP_BUFFER_SIZE);
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid, NULLPTR);
                 }
 
@@ -541,6 +546,11 @@ namespace ppp {
 
                 /** @brief Frame length upper-bound check (P0-4A): reject frames that exceed PPP_BUFFER_SIZE. */
                 if (payload_length > PPP_BUFFER_SIZE) {
+                    ppp::telemetry::Log(Level::kInfo,
+                        "transmission",
+                        "base94 frame too large payload_length=%d max=%d in_memory=no",
+                        payload_length,
+                        PPP_BUFFER_SIZE);
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid, NULLPTR);
                 }
 
@@ -1272,6 +1282,16 @@ namespace ppp {
                 else {
                     ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::TunnelReadFailed);
                 }
+            }
+
+            if (NULLPTR == result) {
+                ppp::telemetry::Log(Level::kInfo,
+                    "transmission",
+                    "Read failed outlen=%d error=%d disposed=%s finalized=%s",
+                    outlen,
+                    (int)ppp::diagnostics::GetLastErrorCode(),
+                    disposed_.load(std::memory_order_acquire) ? "yes" : "no",
+                    finalized_.load(std::memory_order_acquire) ? "yes" : "no");
             }
 
             return result;
