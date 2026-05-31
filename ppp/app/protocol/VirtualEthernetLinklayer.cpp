@@ -561,6 +561,7 @@ namespace ppp {
                 uint16_t    vlan;               // VLAN ID (network order)
                 uint16_t    max_connections;    // max concurrent connections (network order)
                 Byte        acceleration;       // acceleration flag (0/1)
+                Byte        ordering_caps;       // receiver ordering capability bits (bit0 = FLOW_V2); optional trailing byte
             } VirtualEthernetLinklayer_MUX_IL;
 
             // MUXON acknowledgment structure (includes action byte)
@@ -847,16 +848,29 @@ namespace ppp {
                     return false;
                 }
                 elif (packet_action == PacketAction_MUX) {            // MUX setup request
-                    static constexpr int MUX_IL_REFT = sizeof(VirtualEthernetLinklayer_MUX_IL) - 1;
+                    // Required length covers every field except the action byte `il`
+                    // AND except the optional trailing ordering_caps byte, so that
+                    // older peers (which never send ordering_caps) still parse.
+                    static constexpr int MUX_IL_REFT = sizeof(VirtualEthernetLinklayer_MUX_IL) - 1 - (int)sizeof(Byte);
 
                     if (packet_length >= MUX_IL_REFT) {
                         VirtualEthernetLinklayer_MUX_IL* pil = reinterpret_cast<VirtualEthernetLinklayer_MUX_IL*>(p - 1);
-                        ppp::telemetry::Log(Level::kDebug, "protocol", "MUX received vlan=%u max_connections=%u",
+
+                        // ordering_caps is an optional trailing byte; absent (older peer) => 0 (=COMPAT).
+                        // packet_length excludes the leading action byte, so the full struct on the
+                        // wire is present only when packet_length >= sizeof(struct) - 1.
+                        Byte ordering_caps = 0;
+                        if (packet_length >= (int)(sizeof(VirtualEthernetLinklayer_MUX_IL) - 1)) {
+                            ordering_caps = pil->ordering_caps;
+                        }
+
+                        ppp::telemetry::Log(Level::kDebug, "protocol", "MUX received vlan=%u max_connections=%u caps=%u",
                                             static_cast<unsigned int>(ntohs(pil->vlan)),
-                                            static_cast<unsigned int>(ntohs(pil->max_connections)));
+                                            static_cast<unsigned int>(ntohs(pil->max_connections)),
+                                            static_cast<unsigned int>(ordering_caps));
                         ppp::telemetry::Count("protocol.mux.received", 1);
                         return global::PACKET_Result(OnMux(transmission, ntohs(pil->vlan), ntohs(pil->max_connections), 
-                                     pil->acceleration != 0, y), ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                                     pil->acceleration != 0, ordering_caps, y), ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
                     } else {
                         return packet_length == 0;
                     }
@@ -1222,7 +1236,7 @@ namespace ppp {
             // Send MUX setup request.
             // ---------------------------------------------------------------------
             /** @brief Sends MUX setup request packet. */
-            bool VirtualEthernetLinklayer::DoMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, YieldContext& y) noexcept 
+            bool VirtualEthernetLinklayer::DoMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, Byte ordering_caps, YieldContext& y) noexcept 
             {
                 MemoryStream ms;
                 VirtualEthernetLinklayer_MUX_IL data;
@@ -1230,11 +1244,13 @@ namespace ppp {
                 data.vlan             = htons(vlan);
                 data.max_connections  = htons(max_connections);
                 data.acceleration     = acceleration ? 1 : 0;
+                data.ordering_caps    = ordering_caps;
 
                 if (ms.Write(&data, 0, sizeof(data))) {
                     std::shared_ptr<Byte> buffer = ms.GetBuffer();
-                    ppp::telemetry::Log(Level::kDebug, "protocol", "MUX sent vlan=%u max_connections=%u",
-                                        static_cast<unsigned int>(vlan), static_cast<unsigned int>(max_connections));
+                    ppp::telemetry::Log(Level::kDebug, "protocol", "MUX sent vlan=%u max_connections=%u caps=%u",
+                                        static_cast<unsigned int>(vlan), static_cast<unsigned int>(max_connections),
+                                        static_cast<unsigned int>(ordering_caps));
                     ppp::telemetry::Count("protocol.mux.sent", 1);
                     return global::PACKET_Result(transmission->Write(y, buffer.get(), ms.GetPosition()), ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
                 }

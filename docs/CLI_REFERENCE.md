@@ -263,6 +263,75 @@ ppp --mode=client -c=./client.json --tun-mux=4
 MUX acceleration mode. Controls how the multiplexed connections distribute traffic.
 Valid values depend on the build configuration.
 
+### `--mux-mode=<compat|flow|balance|stripe>`
+
+MUX scheduler mode. It selects how queued frames are spread across the underlying mux
+linklayers. It is a **send-side policy only**: the VMUX wire protocol still uses a single
+global sequence/ack window, so the receiver always delivers in global order. None of the
+modes change the wire format, and the option is not negotiated — configure both peers the
+same way when you want matching behavior in both directions.
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `compat` | Existing scheduler; queued frames go to whichever linklayer is free. | Default / rollback / regression baseline. |
+| `flow` | Sticky primary link: one active linklayer is chosen and queued frames flow through it, preserving single-flow ordering/throughput. | Single-flow performance on jittery links. |
+| `balance` | Per-connection sticky load balancing: each logical connection is bound to a least-loaded active linklayer (round-robin on first use, migrates if the link drops); frames within a connection stay on that link when it has send credit. | Many concurrent connections wanting throughput spread across links. |
+| `stripe` | Experimental striping: queued frames are distributed round-robin across all active linklayers regardless of connection. | Future pseudo-MPTCP / 9000-MTU work. |
+
+> **`balance` caveat:** because the receiver still uses one global sequence/ack window,
+> balancing improves link utilization for multi-connection workloads but does not remove
+> receiver-side head-of-line blocking; a slow link can still stall global delivery. True
+> per-flow delivery requires a receiver-side protocol change (see issue #5 design notes).
+>
+> **`stripe` caveat (experimental):** spreading one logical flow across links of different
+> speeds causes heavy reordering at the receiver (buffered in the reorder queue). It can
+> make single-flow performance *worse* than `compat`/`flow`. It is provided as an
+> experimental base for future per-link sequencing / DSN work, not as a fast path today.
+
+Set `mux.mode` in JSON or pass `--mux-mode=flow` at startup (CLI overrides JSON).
+
+**Default:** `compat`
+
+### `--debug-key=<secret>` and `--mux-mode-set=<compat|flow|balance|stripe>`
+
+Debug-only remote control of the peer's scheduler mode. This is opt-in and intended for
+testing on jittery links, not for production.
+
+- `--debug-key=<secret>` sets a shared secret. Remote mux-mode control is **disabled
+  unless this key is non-empty on the receiving side**. Configure the **same** key on
+  both client and server.
+- `--mux-mode-set=<compat|flow|balance|stripe>` asks the *other* endpoint to switch its
+  scheduler mode. The request is sent once, after the mux session is established, over the
+  existing encrypted vmux transport (a new `cmd_mux_mode_set` control frame; no new
+  per-packet header field).
+
+The receiver applies the change only when its own `--debug-key` is non-empty and matches
+the key carried in the frame (compared in constant time). A missing key, a mismatched
+key, or a malformed frame is logged and ignored — the session is never torn down, so a
+forged frame cannot disrupt traffic.
+
+The pushed mode is **sticky on the receiver**: it is recorded as a runtime override and
+survives mux session rebuilds (link flap, idle/heartbeat timeout, reconnect), so it does
+not silently revert to the configured `mux.mode` on the next reconnect. It is not written
+to disk and resets to the configured value when the receiver process restarts.
+
+You can also set the key in JSON as `mux.debug.key`. The `--mux-mode-set` request itself
+is transient (CLI only) and is never written back to the configuration file.
+
+> **Compatibility:** the `cmd_mux_mode_set` control frame is only emitted when both
+> `--debug-key` and `--mux-mode-set` are set. Both peers must run a build that
+> understands this frame; sending it to an older peer that predates the feature will be
+> treated as an invalid command and drop that mux session. Only use it when both ends run
+> a matching build.
+
+```
+# server (allows remote control, same key as client)
+ppp --mode=server -c=./server.json --debug-key=lab-secret
+
+# client (push the server to flow mode at runtime for an A/B test)
+ppp --mode=client -c=./client.json --tun-mux=8 --debug-key=lab-secret --mux-mode-set=flow
+```
+
 ### `--tun-promisc=[yes|no]`
 
 Promiscuous mode on Linux and macOS. When `yes`, the virtual NIC accepts all frames
@@ -532,6 +601,9 @@ The bottom status row is split into two columns (roughly 60/40):
 | `--tun-host` | `yes` |
 | `--rt` | `yes` |
 | `--tun-mux` | `0` (disabled) |
+| `--mux-mode` | `compat` |
+| `--debug-key` | (disabled) |
+| `--mux-mode-set` | (off) |
 
 ---
 

@@ -93,6 +93,52 @@ namespace {
     }
 
     /**
+     * @brief Normalizes textual MUX scheduler mode.
+     *
+     * Accepts the implemented schedulers (`compat`, `flow`) plus a few
+     * convenience aliases. Design modes that are reserved but not yet
+     * implemented (`balance`, `stripe`) and any unrecognized value are
+     * normalized to a supported scheduler and described through the optional
+     * @p note out-parameter so startup can warn without failing.
+     *
+     * @param mode Text mode value as written in JSON or on the CLI.
+     * @param note Optional out-parameter describing why the value changed.
+     * @return Supported mode string; defaults to compat.
+     */
+    static ppp::string                                      NormalizeMuxMode(const ppp::string& mode, ppp::string* note = nullptr) noexcept {
+        if (NULLPTR != note) {
+            note->clear();
+        }
+
+        ppp::string value = ToLower(LTrim(RTrim(mode)));
+        if (value == "flow" || value == "flow-v1" || value == "primary" || value == "primary-link") {
+            return "flow";
+        }
+
+        if (value == "compat" || value == "legacy" || value == "default") {
+            return "compat";
+        }
+
+        if (value == "balance" || value == "balanced" || value == "lb" || value == "load-balance") {
+            return "balance";
+        }
+
+        if (value == "stripe" || value == "striped" || value == "striping") {
+            return "stripe";
+        }
+
+        if (value.empty()) {
+            // Missing field: keep the historical/compatible scheduler silently.
+            return "compat";
+        }
+
+        if (NULLPTR != note) {
+            *note = "mux.mode '" + value + "' is not a recognized scheduler; falling back to 'compat'";
+        }
+        return "compat";
+    }
+
+    /**
      * @brief Parses an IPv6 CIDR string into prefix and prefix length.
      * @param cidr CIDR input.
      * @param prefix Output prefix string.
@@ -239,8 +285,15 @@ namespace ppp {
 
             config.mux.connect.timeout = PPP_MUX_CONNECT_TIMEOUT;
             config.mux.inactive.timeout = PPP_MUX_INACTIVE_TIMEOUT;
+            config.mux.mode = "compat";
+            config.mux.congestions = PPP_MUX_DEFAULT_CONGESTIONS;
             config.mux.keep_alived[0] = PPP_TCP_CONNECT_TIMEOUT;
             config.mux.keep_alived[1] = PPP_MUX_CONNECT_TIMEOUT;
+            config.mux.flow_v2 = false;
+            config.mux.flow.reorder.bytes = PPP_MUX_FLOW_REORDER_BYTES;
+            config.mux.flow.reorder.timeout = PPP_MUX_FLOW_REORDER_TIMEOUT;
+            config.mux.debug.key = "";
+            config.mux.debug.set_mode = "";
 
             config.websocket.listen.ws = IPEndPoint::MinPort;
             config.websocket.listen.wss = IPEndPoint::MinPort;
@@ -358,6 +411,7 @@ namespace ppp {
             config.geo_rules.append_bypass.clear();
             config.geo_rules.append_dns_rules.clear();
 
+            config._mux_mode_diagnostic.clear();
             memset(config._lcgmods, 0, sizeof(config._lcgmods));
         }
 
@@ -632,6 +686,18 @@ namespace ppp {
 
             if (config.mux.congestions < 0 || (config.mux.congestions > 0 && config.mux.congestions < PPP_MUX_MIN_CONGESTIONS)) {
                 config.mux.congestions = PPP_MUX_DEFAULT_CONGESTIONS;
+            }
+
+            config.mux.mode = NormalizeMuxMode(config.mux.mode, &config._mux_mode_diagnostic);
+            config.mux.debug.key = LTrim(RTrim(config.mux.debug.key));
+            config.mux.debug.set_mode = LTrim(RTrim(config.mux.debug.set_mode));
+
+            if (config.mux.flow.reorder.bytes <= 0) {
+                config.mux.flow.reorder.bytes = PPP_MUX_FLOW_REORDER_BYTES;
+            }
+
+            if (config.mux.flow.reorder.timeout <= 0) {
+                config.mux.flow.reorder.timeout = PPP_MUX_FLOW_REORDER_TIMEOUT;
             }
 
             if (config.udp.static_.aggligator < 0) {
@@ -1542,6 +1608,11 @@ namespace ppp {
             config.mux.inactive.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["inactive"]["timeout"]);
             config.mux.connect.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["connect"]["timeout"]);
             config.mux.congestions = (int)JsonAuxiliary::AsInt64(json["mux"]["congestions"], -1);
+            config.mux.mode = JsonAuxiliary::AsValue<ppp::string>(json["mux"]["mode"]);
+            config.mux.flow_v2 = JsonAuxiliary::AsValue<bool>(json["mux"]["flow-v2"]);
+            config.mux.flow.reorder.bytes = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["bytes"]);
+            config.mux.flow.reorder.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["timeout"]);
+            config.mux.debug.key = JsonAuxiliary::AsValue<ppp::string>(json["mux"]["debug"]["key"]);
             config.mux.keep_alived[0] = JsonAuxiliary::AsValue<int>(json["mux"]["keep-alived"][0]);
             config.mux.keep_alived[1] = JsonAuxiliary::AsValue<int>(json["mux"]["keep-alived"][1]);
 
@@ -1843,6 +1914,13 @@ namespace ppp {
             mux["inactive"]["timeout"] = config.mux.inactive.timeout;
             mux["connect"]["timeout"] = config.mux.connect.timeout;
             mux["congestions"] = config.mux.congestions;
+            mux["mode"] = config.mux.mode;
+            mux["flow-v2"] = config.mux.flow_v2;
+            mux["flow"]["reorder"]["bytes"] = config.mux.flow.reorder.bytes;
+            mux["flow"]["reorder"]["timeout"] = config.mux.flow.reorder.timeout;
+            if (!config.mux.debug.key.empty()) {
+                mux["debug"]["key"] = config.mux.debug.key;
+            }
 
             // Set keep-alived structure
             Json::Value config_mux_keep_alived(Json::arrayValue);
@@ -2152,6 +2230,57 @@ namespace ppp {
                 ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "security",
                     "Startup security diagnostics: all checks passed");
             }
+        }
+
+        /**
+         * @brief Emits the active MUX scheduler mode and any normalization note.
+         *
+         * The active `mux.mode` is reported for observability (Phase 1). When
+         * `Loaded()` normalized the configured value (a reserved-but-unimplemented
+         * mode such as `balance`/`stripe`, or an unrecognized token), the captured
+         * note is emitted as a non-fatal warning on both telemetry and console.
+         */
+        void AppConfiguration::EmitMuxDiagnostics() noexcept {
+            const AppConfiguration& config = *this;
+
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux",
+                "Active scheduler mode: %s", config.mux.mode.c_str());
+            ppp::ConsoleFormat("[mux] scheduler mode: %s\n", config.mux.mode.c_str());
+
+            if (!config._mux_mode_diagnostic.empty()) {
+                ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "%s", config._mux_mode_diagnostic.c_str());
+                ppp::ConsoleFormat("[mux] WARN: %s - startup continues (non-fatal)\n", config._mux_mode_diagnostic.c_str());
+            }
+        }
+
+        /**
+         * @brief Returns the scheduler mode token for newly created mux sessions.
+         *
+         * A debug runtime override (0=compat, 1=flow, 2=balance, 3=stripe) takes
+         * precedence over the configured `mux.mode` so a peer-pushed change
+         * survives session rebuilds.
+         */
+        ppp::string AppConfiguration::GetEffectiveMuxMode() const noexcept {
+            switch (_mux_mode_runtime_override.load(std::memory_order_acquire)) {
+            case 0:
+                return "compat";
+            case 1:
+                return "flow";
+            case 2:
+                return "balance";
+            case 3:
+                return "stripe";
+            default:
+                return this->mux.mode;
+            }
+        }
+
+        /**
+         * @brief Records (or clears) the debug-only runtime scheduler override.
+         */
+        void AppConfiguration::SetMuxModeRuntimeOverride(int mode_value) noexcept {
+            int normalized = (mode_value >= 0 && mode_value <= 3) ? mode_value : -1;
+            _mux_mode_runtime_override.store(normalized, std::memory_order_release);
         }
 
         namespace extensions {
