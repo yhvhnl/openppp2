@@ -404,8 +404,8 @@ key.kf / key.kh / key.kl / key.kx / key.sb —— 非法值时重置为框架内
 |------|------|------|
 | `connect.timeout` | int | MUX 子连接建立超时（秒） |
 | `inactive.timeout` | int | MUX 空闲超时（秒） |
-| `mode` | string | 调度模式；`compat` 保持现有多 link 调度，`flow` 单 primary linklayer 保留单流性能，`balance` 按连接粘滞绑定到负载最低的 link（负载均衡），`stripe`（实验性）将帧轮询分散到多 link。四者均为当前全局 seq/ack 窗口下的发送端策略。无法识别的值归一化为 `compat` 并打印非致命启动告警 |
-| `flow-v2` | bool | 启用可协商的**接收端按流定序**能力（flow v2）。两端都为 `true` 时，会话按连接独立定序交付（per-connection DSN），一条慢链路不再队头阻塞其它连接；任一端为 `false`（默认）或为旧版本时回退到现有全局定序（`compat`），不破坏互通。这是让 `balance` 真正生效的接收端配套 |
+| `mode` | string | 调度模式；`compat` 在全局 seq/ack 窗口下保持现有多 link 调度；`flow`、`balance`、`stripe` 会把一个会话的帧分散到**多条链路**，因此**自动协商接收端按流定序（flow v2）**，避免跨链路乱序被误判为丢包。`flow` 把每个连接固定绑定一条链路（按连接粘滞），使某连接的大流量无法对另一连接的首包造成队头阻塞；`balance` 把每个连接绑定到负载最低的 link；`stripe`（实验性）将帧轮询分散到多 link。无法识别的值归一化为 `compat` 并打印非致命启动告警 |
+| `flow-v2` | bool | 显式启用可协商的**接收端按流定序**能力（flow v2）。注意 `flow`/`balance`/`stripe` 已会自动广告该能力，因此只有在 `compat` 下或需强制广告时才需设置；协商为交集，仅当**两端**都支持时才启用，否则回退到单链路全局定序（`compat`），不破坏互通 |
 | `flow.reorder.bytes` | int | flow v2 下每连接重排缓冲字节上界（严格 > 0，默认 1048576）。约束接收端内存：某连接缓冲的乱序字节将超过该上界时跳过最老缺口（丢失字节由被隧道的 TCP 重传补偿） |
 | `flow.reorder.timeout` | int | flow v2 下每连接缺口等待超时（毫秒，严格 > 0，默认 2000）。缺口帧在该窗口内未到达则跳过，避免交付停滞 |
 | `debug.key` | string | 调试专用远程控制共享密钥。两端非空且一致时，可用 `--mux-mode-set` 推动对端切换调度模式；空（默认）则关闭远程控制。`--mux-mode-set` 仅命令行有效，不写入 JSON |

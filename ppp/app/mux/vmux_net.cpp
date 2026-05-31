@@ -398,10 +398,16 @@ namespace vmux {
                 }
 
                 if (ok) {
-                    if (mode_ == mux_mode_balance || mode_ == mux_mode_stripe) {
-                        // Policy modes re-select the link per packet: return this
-                        // link's send credit and let the scheduler route the next
-                        // queued frame according to affinity / round-robin.
+                    // The per-packet policy drain (balance/stripe, and flow once
+                    // FLOW_V2 is negotiated) re-selects the link for every frame:
+                    // return this link's send credit and let the scheduler route
+                    // the next queued frame by policy. The single-link drain
+                    // (compat, and flow when it fell back to compat) keeps sending
+                    // the next frame on the same link to preserve global ordering.
+                    bool per_packet_policy_drain =
+                        mode_ == mux_mode_balance || mode_ == mux_mode_stripe ||
+                        (mode_ == mux_mode_flow && ordering_mode_ == ordering_flow_v2);
+                    if (per_packet_policy_drain) {
                         tx_links_.emplace_back(linklayer);
                         ok = process_tx_all_packets();
                     }
@@ -1279,8 +1285,22 @@ namespace vmux {
         return true;
     }
 
-    /** @brief Drains queued packets through the flow primary linklayer. */
+    /** @brief Drains queued packets for flow mode.
+     *  @details When the session negotiated FLOW_V2 (per-flow receiver ordering),
+     *           frames are spread across links with per-connection stickiness
+     *           (same connection -> same link, preserving its DSN order; different
+     *           connections -> different links) so one connection's bulk transfer
+     *           cannot head-of-line block another connection's first packets.
+     *           When ordering is COMPAT (e.g. an older peer that did not negotiate
+     *           FLOW_V2), it stays on a single primary link, because compat global
+     *           ordering would treat cross-link reordering as loss. */
     bool vmux_net::process_tx_flow_packets() noexcept {
+        // FLOW_V2 negotiated: per-connection sticky spread across all links.
+        if (ordering_mode_ == ordering_flow_v2) {
+            return process_tx_balance_packets();
+        }
+
+        // COMPAT fallback: single primary link (legacy flow behavior).
         tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
         tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
         if (packet_tail == packet_endl) {

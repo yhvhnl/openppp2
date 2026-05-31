@@ -266,6 +266,18 @@ namespace vmux {
             return cmd == cmd_push || cmd == cmd_fin;
         }
         /**
+         * @brief True for scheduler modes that spread one session's frames across
+         *        multiple links and therefore require per-flow receiver ordering.
+         * @details flow/balance/stripe distribute frames over more than one
+         *          link-layer, so the receiver must order each connection
+         *          independently (FLOW_V2) to avoid cross-link reordering being
+         *          mistaken for loss under the single global compat sequence.
+         *          compat keeps the legacy single-sequence behavior.
+         */
+        static bool                                                                 mode_requires_flow_v2(mux_mode mode) noexcept {
+            return mode == mux_mode_flow || mode == mux_mode_balance || mode == mux_mode_stripe;
+        }
+        /**
          * @brief Push a debug-only mux-mode change request to the peer.
          * @param mode  Desired scheduler mode for the remote endpoint.
          * @return true when the control frame was queued for transmit.
