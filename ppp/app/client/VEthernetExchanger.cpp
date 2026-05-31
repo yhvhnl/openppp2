@@ -789,7 +789,8 @@ namespace ppp {
                         break;
                     }
                     else {
-                        mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, false, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_LOCAL) != 0);
+                        vmux::vmux_net::mux_mode mux_mode = vmux::vmux_net::parse_mode(configuration->GetEffectiveMuxMode());
+                        mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, false, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_LOCAL) != 0, mux_mode);
                         if (NULLPTR == mux) {
                             break;
                         }
@@ -825,11 +826,15 @@ namespace ppp {
                     mux_ = mux;
 
                     successes = YieldContext::Spawn(buffer_allocator.get(), *vnet_context,
-                        [self, this, vnet_transmission, mux, vnet_context](YieldContext& y) noexcept {
+                        [self, this, vnet_transmission, mux, vnet_context, configuration](YieldContext& y) noexcept {
                             bool ok = false;
                             if (!disposed_.load(std::memory_order_acquire)) {
                                 uint16_t max_connections = mux->get_max_connections();
-                                ok = DoMux(vnet_transmission, mux->Vlan, max_connections, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_REMOTE) != 0, y);
+                                // Advertise FLOW_V2 capability when locally enabled; the server
+                                // echoes back the agreed result in its MUX reply (see OnMux).
+                                Byte ordering_caps = (NULLPTR != configuration && configuration->mux.flow_v2)
+                                    ? (Byte)vmux::vmux_net::ordering_caps_flow_v2 : (Byte)0;
+                                ok = DoMux(vnet_transmission, mux->Vlan, max_connections, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_REMOTE) != 0, ordering_caps, y);
                             }
 
                             if (!ok) {
@@ -1079,7 +1084,7 @@ namespace ppp {
             }
 
             /** @brief Handles mux negotiation callback and starts vmux linking. */
-            bool VEthernetExchanger::OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, YieldContext& y) noexcept {
+            bool VEthernetExchanger::OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, Byte ordering_caps, YieldContext& y) noexcept {
                 std::shared_ptr<vmux::vmux_net> mux = mux_;
                 if (NULLPTR != mux) {
                     bool successed = false;
@@ -1090,6 +1095,13 @@ namespace ppp {
                         if (!established) {
                             auto configuration = GetConfiguration();
                             auto allocator = configuration->GetBufferAllocator();
+
+                            // Apply the negotiated receiver ordering mode (flow v2) before linking.
+                            // The server echoes the agreed capability in its MUX reply; agreed
+                            // FLOW_V2 requires this end to also have it enabled (fail-safe to compat).
+                            bool local_supports_flow_v2 = NULLPTR != configuration && configuration->mux.flow_v2;
+                            bool agreed_flow_v2 = local_supports_flow_v2 && ((ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0);
+                            mux->set_ordering_mode(agreed_flow_v2 ? vmux::vmux_net::ordering_flow_v2 : vmux::vmux_net::ordering_compat);
 
                             successed = MuxConnectAllLinklayers(allocator, mux);
                         }

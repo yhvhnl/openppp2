@@ -376,8 +376,20 @@ namespace ppp {
             }
 
             /** @brief Applies VMUX enable/disable request and acknowledges resulting state. */
-            bool VirtualEthernetExchanger::OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, YieldContext& y) noexcept {
+            bool VirtualEthernetExchanger::OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, Byte ordering_caps, YieldContext& y) noexcept {
                 bool err = true;
+
+                // Negotiated receiver ordering mode (flow v2). agreed == FLOW_V2 only when the
+                // peer advertised the capability AND this end is configured to allow it. Anything
+                // else (older peer, caps bit clear, mux.flow-v2 disabled) falls back to compat.
+                std::shared_ptr<ppp::configurations::AppConfiguration> configuration = switcher_->GetConfiguration();
+                bool local_supports_flow_v2 = NULLPTR != configuration && configuration->mux.flow_v2;
+                bool peer_supports_flow_v2 = (ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0;
+                vmux::vmux_net::receiver_ordering_mode agreed =
+                    (local_supports_flow_v2 && peer_supports_flow_v2)
+                        ? vmux::vmux_net::ordering_flow_v2
+                        : vmux::vmux_net::ordering_compat;
+
                 for (;;) {
                     if (disposed_) {
                         break;
@@ -405,13 +417,17 @@ namespace ppp {
                         break;
                     }
 
-                    mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, true, acceleration);
+                    vmux::vmux_net::mux_mode mux_mode = NULLPTR != configuration ? vmux::vmux_net::parse_mode(configuration->GetEffectiveMuxMode()) : vmux::vmux_net::mux_mode_compat;
+                    mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, true, acceleration, mux_mode);
                     if (NULLPTR != mux) {
                         mux->Vlan = vlan;
                         mux->Firewall = GetFirewall();
                         mux->Logger = switcher_->GetLogger();
-                        mux->AppConfiguration = switcher_->GetConfiguration();
+                        mux->AppConfiguration = configuration;
                         mux->BufferAllocator = transmission->BufferAllocator;
+
+                        // Apply the negotiated ordering mode before the session is established.
+                        mux->set_ordering_mode(agreed);
 
                         if (mux->update()) {
                             err = false;
@@ -431,10 +447,12 @@ namespace ppp {
                         mux->close_exec();
                     }
 
-                    DoMux(transmission, 0, 0, false, y);
+                    DoMux(transmission, 0, 0, false, 0, y);
                 }
                 else {
-                    DoMux(transmission, vlan, max_connections, acceleration, y);
+                    // Echo the agreed ordering capability back so the client learns the result.
+                    Byte agreed_caps = (agreed == vmux::vmux_net::ordering_flow_v2) ? (Byte)vmux::vmux_net::ordering_caps_flow_v2 : (Byte)0;
+                    DoMux(transmission, vlan, max_connections, acceleration, agreed_caps, y);
                 }
 
                 return true;

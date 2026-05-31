@@ -60,7 +60,7 @@ flowchart TD
 | `ip` | public/interface IP 字符串 | 会话绑定 |
 | `udp` | UDP timeout、DNS、监听端口、static UDP | 数据报路径、DNS 客户端 |
 | `tcp` | TCP timeout、连接策略、监听端口、backlog | `ITcpipTransmission` |
-| `mux` | MUX timeout 和 keepalive | MUX 通道 |
+| `mux` | MUX timeout、keepalive 和调度模式 | MUX 通道 |
 | `websocket` | WS/WSS 监听、TLS、host/path | `IWebsocketTransmission` |
 | `key` | 协议身份和包变换策略 | `ITransmission`、`VirtualEthernetPacket` |
 | `vmem` | 内存型虚拟文件行为 | vmem 驱动 |
@@ -78,7 +78,7 @@ graph TD
     APP --> KEY["key\n密钥 / 变换策略"]
     APP --> SERVER["server\n服务端 / IPv6 / backend"]
     APP --> CLIENT["client\n客户端 / 路由 / 代理"]
-    APP --> MUX["mux\n多路复用"]
+    APP --> MUX["mux\n多路复用 / 调度"]
     APP --> VIRR["virr / vbgp\n路由刷新"]
     APP --> VMEM["vmem\n虚拟内存文件"]
 ```
@@ -109,6 +109,9 @@ tcp.backlog          = 511;  ///< 监听队列深度
 // MUX 相关默认值
 mux.connect.timeout  = 5;
 mux.inactive.timeout = 300;
+mux.mode             = "compat";
+mux.congestions      = 134217728;
+mux.keep_alived      = [5, 20];
 
 // WebSocket 默认关闭（ws 和 wss 端口均为 0）
 websocket.listen.ws  = 0;
@@ -379,6 +382,38 @@ key.kf / key.kh / key.kl / key.kx / key.sb —— 非法值时重置为框架内
 }
 ```
 
+### 7.6 `mux` 块
+
+```json
+{
+    "mux": {
+        "connect": {
+            "timeout": 20
+        },
+        "inactive": {
+            "timeout": 60
+        },
+        "congestions": 134217728,
+        "mode": "compat",
+        "keep-alived": [5, 20]
+    }
+}
+```
+
+| 字段 | 类型 | 作用 |
+|------|------|------|
+| `connect.timeout` | int | MUX 子连接建立超时（秒） |
+| `inactive.timeout` | int | MUX 空闲超时（秒） |
+| `mode` | string | 调度模式；`compat` 保持现有多 link 调度，`flow` 单 primary linklayer 保留单流性能，`balance` 按连接粘滞绑定到负载最低的 link（负载均衡），`stripe`（实验性）将帧轮询分散到多 link。四者均为当前全局 seq/ack 窗口下的发送端策略。无法识别的值归一化为 `compat` 并打印非致命启动告警 |
+| `flow-v2` | bool | 启用可协商的**接收端按流定序**能力（flow v2）。两端都为 `true` 时，会话按连接独立定序交付（per-connection DSN），一条慢链路不再队头阻塞其它连接；任一端为 `false`（默认）或为旧版本时回退到现有全局定序（`compat`），不破坏互通。这是让 `balance` 真正生效的接收端配套 |
+| `flow.reorder.bytes` | int | flow v2 下每连接重排缓冲字节上界（严格 > 0，默认 1048576）。约束接收端内存：某连接缓冲的乱序字节将超过该上界时跳过最老缺口（丢失字节由被隧道的 TCP 重传补偿） |
+| `flow.reorder.timeout` | int | flow v2 下每连接缺口等待超时（毫秒，严格 > 0，默认 2000）。缺口帧在该窗口内未到达则跳过，避免交付停滞 |
+| `debug.key` | string | 调试专用远程控制共享密钥。两端非空且一致时，可用 `--mux-mode-set` 推动对端切换调度模式；空（默认）则关闭远程控制。`--mux-mode-set` 仅命令行有效，不写入 JSON |
+| `congestions` | int | MUX 拥塞窗口预算 |
+| `keep-alived` | int[2] | keepalive 间隔范围 `[min, max]`（秒） |
+
+并行 MUX 子连接数量仍由运行时 `--tun-mux=<connections>` 指定，不使用 `mux.max-connections` JSON 字段。
+
 ---
 
 ## 8. IPv6 Server 行为
@@ -492,7 +527,7 @@ flowchart LR
 | `server` | `VirtualEthernetSwitcher`、`VirtualEthernetExchanger`、管理后端桥 |
 | `client` | `VEthernetNetworkSwitcher`、`VEthernetExchanger`、HTTP 代理 |
 | `udp` | UDP 数据报路径、DNS 客户端、static UDP 聚合器 |
-| `mux` | MUX 通道管理器 |
+| `mux` | MUX 通道管理器、发送调度模式 |
 | `vmem` | vmem 虚拟文件驱动 |
 | `virr` | virr IP 列表更新器 |
 | `vbgp` | vBGP 路由更新器 |

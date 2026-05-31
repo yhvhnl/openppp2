@@ -131,8 +131,20 @@ namespace ppp {
                 struct {
                     int                                                     timeout;        ///< MUX connect handshake timeout in seconds.
                 }                                                           connect;
+                ppp::string                                                 mode;           ///< MUX transmit scheduler mode: compat or flow.
                 int                                                         congestions;    ///< MUX congestion control level; higher values reduce burst aggressiveness.
                 int                                                         keep_alived[2]; ///< MUX keep-alive interval range [min, max] in seconds.
+                bool                                                        flow_v2;        ///< Enable negotiated per-flow receiver ordering (flow v2); default false.
+                struct {
+                    struct {
+                        int                                                 bytes;          ///< Per-connection reorder buffer byte cap (flow v2); strictly > 0.
+                        int                                                 timeout;        ///< Per-connection gap wait timeout in milliseconds (flow v2); strictly > 0.
+                    }                                                       reorder;
+                }                                                           flow;           ///< Per-flow (flow v2) receiver ordering parameters.
+                struct {
+                    ppp::string                                             key;            ///< Shared debug secret (`--debug-key`); empty disables remote mux-mode control.
+                    ppp::string                                             set_mode;       ///< Transient `--mux-mode-set` request; pushes a mode change to the peer once at startup.
+                }                                                           debug;          ///< Debug-only remote control of the peer's scheduler mode.
             }                                                               mux;            ///< Multiplexed connection channel parameters.
             struct {
                 struct {
@@ -406,6 +418,24 @@ namespace ppp {
              */
             void                                                            EmitSecurityDiagnostics() noexcept;
 
+            /**
+             * @brief Emits a startup report describing the active MUX scheduler.
+             *
+             * Logs the active `mux.mode` (Phase 1 observability) and, when the
+             * loaded value was normalized (reserved-but-unimplemented mode or an
+             * unrecognized value), emits a non-fatal warning describing the
+             * fallback. Startup never fails as a result of this call.
+             *
+             * @note Called once during application startup after telemetry is
+             *       configured.  Safe to call multiple times (idempotent).
+             */
+            void                                                            EmitMuxDiagnostics() noexcept;
+            /**
+             * @brief Re-runs configuration normalization after runtime CLI overrides.
+             * @return True when normalization completes.
+             */
+            bool                                                            Normalize() noexcept { return Loaded(); }
+
         private:
             /**
              * @brief Validates and normalizes loaded values.
@@ -419,6 +449,24 @@ namespace ppp {
         private:
             int                                                             _lcgmods[LCGMOD_TYPE_MAX]; ///< Precomputed LCG modifier values indexed by `LcgmodType`.
             std::shared_ptr<ppp::threading::BufferswapAllocator>            _BufferAllocator;           ///< Shared buffer pool for packet allocation; may be null until explicitly set.
+            ppp::string                                                     _mux_mode_diagnostic;       ///< Transient note set by Loaded() when mux.mode was normalized; emitted at startup.
+            std::atomic<int>                                                _mux_mode_runtime_override{ -1 }; ///< Debug-only runtime scheduler override (-1=none, else mux::vmux_net::mux_mode); set by remote mux-mode-set, survives session rebuilds.
+
+        public:
+            /**
+             * @brief Returns the effective scheduler mode token for new mux sessions.
+             *
+             * Returns the debug runtime override (set by an accepted remote
+             * `mux-mode-set`) when present; otherwise the configured `mux.mode`.
+             * Safe to call from any thread.
+             */
+            ppp::string                                                     GetEffectiveMuxMode() const noexcept;
+            /**
+             * @brief Records a debug-only runtime scheduler override.
+             * @param mode_value Scheduler mode value (mux::vmux_net::mux_mode), or -1 to clear.
+             * @note Lock-free; readable by the session-rebuild path on another thread.
+             */
+            void                                                            SetMuxModeRuntimeOverride(int mode_value) noexcept;
         };
 
         namespace extensions {
