@@ -45,6 +45,35 @@ int PppApplication::PreparedArgumentEnvironment(int argc, const char* argv[]) no
         return -1;
     }
 
+    if (ppp::HasCommandArgument("--mux-mode", argc, argv)) {
+        configuration->mux.mode = ppp::GetCommandArgument("--mux-mode", argc, argv);
+        if (!configuration->Normalize()) {
+            return -1;
+        }
+    }
+
+    /**
+     * @brief Debug-only remote mux-mode control (opt-in).
+     *
+     * `--debug-key=<secret>` sets a shared secret. When both peers carry the
+     * same non-empty key, a peer may push a scheduler change to the other via
+     * `--mux-mode-set=<compat|flow>`. The key is the authorization gate; the
+     * set request is transient and applied once after the mux session is up.
+     */
+    if (ppp::HasCommandArgument("--debug-key", argc, argv)) {
+        configuration->mux.debug.key = ppp::GetCommandArgument("--debug-key", argc, argv);
+    }
+
+    if (ppp::HasCommandArgument("--mux-mode-set", argc, argv)) {
+        configuration->mux.debug.set_mode = ppp::GetCommandArgument("--mux-mode-set", argc, argv);
+    }
+
+    if (ppp::HasCommandArgument("--debug-key", argc, argv) || ppp::HasCommandArgument("--mux-mode-set", argc, argv)) {
+        if (!configuration->Normalize()) {
+            return -1;
+        }
+    }
+
     client_mode_ = IsModeClientOrServer(argc, argv);
 
     int max_concurrent = configuration->concurrent - 1;
@@ -93,6 +122,13 @@ int PppApplication::PreparedArgumentEnvironment(int argc, const char* argv[]) no
      * both the telemetry log and the console.
      */
     configuration->EmitSecurityDiagnostics();
+
+    /**
+     * @brief Emit the active MUX scheduler mode and any mux.mode normalization
+     *        warning (Phase 1 observability). Non-fatal; placed after telemetry
+     *        is configured so the report reaches both telemetry and console.
+     */
+    configuration->EmitMuxDiagnostics();
 
     return 0;
 }

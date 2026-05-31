@@ -113,9 +113,9 @@ namespace vmux {
          * @note All fields are in host byte order within the vmux subsystem;
          *       callers must not apply htonl/ntohs unless crossing a protocol boundary.
          */
-        typedef struct 
+        typedef struct
 #if defined(__GNUC__) || defined(__clang__)
-            __attribute__((packed)) 
+            __attribute__((packed))
 #endif
         {
             uint32_t                                                                seq;           ///< Frame sequence number used for ordered delivery.
@@ -138,6 +138,7 @@ namespace vmux {
             cmd_fin,                      ///< FIN — close the logical connection gracefully.
             cmd_keep_alived,              ///< KEEP-ALIVE — heartbeat probe frame.
             cmd_acceleration,             ///< ACCELERATION — enable/disable fast-path flag.
+            cmd_mux_mode_set,             ///< MUX-MODE-SET — debug-only request to switch the peer's scheduler mode.
             cmd_max,                      ///< Sentinel — one past the last valid command.
 
             max_buffers_size = UINT16_MAX - sizeof(vmux_hdr), ///< Maximum payload bytes per vmux frame.
@@ -170,7 +171,53 @@ namespace vmux {
         typedef vmux::list<tx_packet>                                               tx_packet_ssqueue;
         typedef vmux::map_pr<uint32_t, rx_packet, packet_less<uint32_t>>            rx_packet_ssqueue;
 
+        /**
+         * @brief Per-connection receive ordering context (flow v2).
+         *
+         * Holds one connection's independent DSN delivery state: the next
+         * expected per-flow DSN, a bounded reorder buffer keyed by DSN, the
+         * tick the oldest buffered frame was queued (gap timeout base), the
+         * current buffered byte total (memory bound), a priming flag, and a
+         * fin-seen flag used to release the context after the FIN is delivered.
+         */
+        struct flow_rx_context {
+            uint32_t                                                                flow_rx_next_         = 0;     ///< Next expected per-flow DSN.
+            rx_packet_ssqueue                                                       flow_reorder_;                ///< Bounded reorder buffer keyed by DSN (packet_less handles wraparound).
+            uint64_t                                                                oldest_buffered_tick_ = 0;     ///< Tick the oldest buffered frame was queued; 0 = no active gap timer.
+            size_t                                                                  buffered_bytes_       = 0;     ///< Sum of buffered frame lengths (memory bound).
+            bool                                                                    primed_               = false; ///< True once flow_rx_next_ has been initialized from the first frame.
+            bool                                                                    fin_seen_             = false; ///< True once a cmd_fin has been delivered for this connection.
+        };
+
         typedef vmux::unordered_map<uint32_t, vmux_skt_ptr>                         vmux_skt_map;
+        typedef vmux::unordered_map<uint32_t, flow_rx_context>                      vmux_flow_map;
+    public:
+        enum mux_mode {
+            mux_mode_compat  = 0,
+            mux_mode_flow    = 1,
+            mux_mode_balance = 2,
+            mux_mode_stripe  = 3,
+        };
+
+        /**
+         * @brief Negotiated receiver-side ordering mode (flow v2).
+         *
+         * ordering_compat keeps the existing single global tx_seq_/rx_ack_
+         * delivery (today's behavior). ordering_flow_v2 delivers each
+         * connection independently (per-flow DSN) so one slow link cannot
+         * head-of-line block other connections. Negotiated via the MUX frame's
+         * ordering_caps byte; defaults to compat and never upgrades unless both
+         * peers explicitly agree.
+         */
+        enum receiver_ordering_mode {
+            ordering_compat  = 0,
+            ordering_flow_v2 = 1,
+        };
+
+        /** @brief MUX capability bit advertised in the handshake (bit0 = FLOW_V2). */
+        enum {
+            ordering_caps_flow_v2 = 0x01,
+        };
 
     public:
         /**
@@ -181,7 +228,7 @@ namespace vmux {
          * @param server_mode true for server-side role.
          * @param acceleration true to enable acceleration by default.
          */
-        vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration) noexcept;
+        vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration, mux_mode mode = mux_mode_compat) noexcept;
         /** @brief Destroy the session and release all managed resources. */
         ~vmux_net() noexcept;
 
@@ -190,6 +237,41 @@ namespace vmux {
         const ContextPtr&                                                           get_context()         noexcept { return context_; }
         uint16_t                                                                    get_max_connections() noexcept { return status_.max_connections; }
         uint64_t                                                                    get_last()            noexcept { return status_.last_; }
+        mux_mode                                                                    get_mode()            noexcept { return mode_; }
+        static mux_mode                                                             parse_mode(const ppp::string& mode) noexcept;
+        /** @brief Map a wire mode byte to a valid scheduler mode (unknown -> compat). */
+        static mux_mode                                                             parse_mode_byte(Byte mode_value) noexcept;
+        static const char*                                                          mode_name(mux_mode mode) noexcept;
+        /** @brief Switch the active scheduler mode at runtime (strand-affine). */
+        void                                                                        set_mode(mux_mode mode) noexcept;
+        /** @brief Returns the negotiated receiver-side ordering mode. */
+        receiver_ordering_mode                                                      get_ordering_mode()   noexcept { return ordering_mode_; }
+        /**
+         * @brief Set the negotiated receiver ordering mode (flow v2).
+         * @param m Negotiated mode.
+         * @note Only takes effect before the session is established; a call
+         *       after establishment is a no-op (no hot compat<->flow-v2 switch).
+         */
+        void                                                                        set_ordering_mode(receiver_ordering_mode m) noexcept;
+        /** @brief True for session-level control frames (keep-alive / mux-mode-set). */
+        static bool                                                                 is_session_control(Byte cmd) noexcept {
+            return cmd == cmd_keep_alived || cmd == cmd_mux_mode_set;
+        }
+        /** @brief True for connection-level control frames (syn / syn-ok / acceleration). */
+        static bool                                                                 is_connection_control(Byte cmd) noexcept {
+            return cmd == cmd_syn || cmd == cmd_syn_ok || cmd == cmd_acceleration;
+        }
+        /** @brief True for per-flow data frames carrying a per-connection DSN (push / fin). */
+        static bool                                                                 is_per_flow_data(Byte cmd) noexcept {
+            return cmd == cmd_push || cmd == cmd_fin;
+        }
+        /**
+         * @brief Push a debug-only mux-mode change request to the peer.
+         * @param mode  Desired scheduler mode for the remote endpoint.
+         * @return true when the control frame was queued for transmit.
+         * @note No-op unless a non-empty `mux.debug.key` is configured locally.
+         */
+        bool                                                                        post_mux_mode_set(mux_mode mode) noexcept;
         const uint32_t&                                                             get_tx_seq()          noexcept { return status_.tx_seq_; }
         const uint32_t&                                                             get_rx_ack()          noexcept { return status_.rx_ack_; }
         bool                                                                        is_disposed()         noexcept { return base_.disposed_; }
@@ -220,10 +302,10 @@ namespace vmux {
          */
         bool                                                                        connect_yield(
             ppp::coroutines::YieldContext&                                          y,
-            const ContextPtr&                                                       context, 
+            const ContextPtr&                                                       context,
             const StrandPtr&                                                        strand,
-            const std::shared_ptr<boost::asio::ip::tcp::socket>&                    sk, 
-            const template_string&                                                  host, 
+            const std::shared_ptr<boost::asio::ip::tcp::socket>&                    sk,
+            const template_string&                                                  host,
             int                                                                     port,
             const std::shared_ptr<vmux_skt_ptr>&                                    return_connection) noexcept;
 
@@ -286,6 +368,20 @@ namespace vmux {
         /** @brief Route inbound payload to target logical connection. */
         void                                                                        packet_input_read(uint32_t connection_id, Byte* buffer, int buffer_size, uint64_t now) noexcept;
 
+        /** @brief Validate and apply a debug-only cmd_mux_mode_set control frame. */
+        void                                                                        packet_input_mux_mode_set(const Byte* buffer, int buffer_size) noexcept;
+
+        /** @brief Per-flow (flow v2) receive path: independent per-connection DSN delivery. */
+        bool                                                                        packet_input_flow(const vmux_linklayer_ptr& linklayer, vmux_hdr* h, int length, uint64_t now) noexcept;
+        /** @brief Deliver one framed packet (push/fin) to its logical connection. */
+        bool                                                                        deliver_one(Byte cmd, vmux_hdr* h, int length, uint64_t now) noexcept;
+        /** @brief Periodically advance per-flow contexts whose gap timed out. */
+        void                                                                        flow_evict_expired(uint64_t now) noexcept;
+        /** @brief Skip the current gap of one flow and replay contiguous buffered frames. */
+        void                                                                        flow_force_advance(uint32_t connection_id, flow_rx_context& fx, uint64_t now) noexcept;
+        /** @brief Release a flow context once its FIN was delivered and buffer drained. */
+        void                                                                        maybe_release_flow(uint32_t connection_id, flow_rx_context& fx) noexcept;
+
         /** @brief Process SYN request and create connecting vmux socket state. */
         bool                                                                        process_rx_connecting(std::shared_ptr<vmux_skt>& skt, uint32_t connection_id, const char* host, int host_size) noexcept;
 
@@ -324,6 +420,28 @@ namespace vmux {
         bool                                                                        post_internal(Byte cmd, const void* packet, int packet_length, uint32_t connection_id, bool acceleration, const PostInternalAsynchronousCallback& posted_ac) noexcept;
         /** @brief Enqueue prebuilt vmux framed packet. */
         bool                                                                        post_internal(const std::shared_ptr<Byte>& packet, int packet_length, bool acceleration, const PostInternalAsynchronousCallback& posted_ac) noexcept;
+        /** @brief True when an underlying link-layer endpoint is usable. */
+        static bool                                                                 is_linklayer_active(const vmux_linklayer_ptr& linklayer) noexcept;
+        /** @brief Pick or refresh the primary link-layer endpoint for flow mode. */
+        vmux_linklayer_ptr                                                          select_primary_linklayer() noexcept;
+        /** @brief Pick a least-loaded active link-layer (balance link selection). */
+        vmux_linklayer_ptr                                                          select_balanced_linklayer() noexcept;
+        /** @brief Pick the sticky link-layer bound to a connection, binding one if needed. */
+        vmux_linklayer_ptr                                                          select_affinity_linklayer(uint32_t connection_id) noexcept;
+        /** @brief Pick the next active link-layer round-robin (stripe distribution). */
+        vmux_linklayer_ptr                                                          select_striped_linklayer() noexcept;
+        /** @brief Read the connection_id stored in a queued vmux frame buffer. */
+        static uint32_t                                                             peek_connection_id(const std::shared_ptr<Byte>& packet, int packet_length) noexcept;
+
+        /** @brief Drain queued transmit packets using the legacy scheduler. */
+        bool                                                                        process_tx_compat_packets() noexcept;
+        /** @brief Drain queued transmit packets through one primary link. */
+        bool                                                                        process_tx_flow_packets() noexcept;
+        /** @brief Drain queued transmit packets with per-connection sticky link selection. */
+        bool                                                                        process_tx_balance_packets() noexcept;
+        /** @brief Drain queued transmit packets striped round-robin across links. */
+        bool                                                                        process_tx_stripe_packets() noexcept;
+
         
         /** @brief Drain all queued transmit packets to available link layers. */
         bool                                                                        process_tx_all_packets() noexcept;
@@ -386,6 +504,18 @@ namespace vmux {
 
         tx_packet_ssqueue                                                           tx_queue_;          ///< Pending outbound packet queue.
         rx_packet_ssqueue                                                           rx_queue_;          ///< Out-of-order inbound packet reorder queue.
+
+        mux_mode                                                                    mode_               = mux_mode_compat; ///< Transmit scheduler policy.
+        vmux_linklayer_ptr                                                          primary_linklayer_; ///< Primary link used by flow mode.
+        bool                                                                        mux_mode_set_pushed_ = false; ///< One-shot guard for the debug mux-mode-set push.
+        vmux::unordered_map<uint32_t, vmux_linklayer_ptr>                           affinity_links_;    ///< connection_id -> sticky link-layer (balance mode).
+        size_t                                                                      stripe_cursor_ = 0; ///< Round-robin cursor over rx_links_ (stripe mode).
+
+        receiver_ordering_mode                                                      ordering_mode_ = ordering_compat; ///< Negotiated receiver ordering mode (flow v2).
+        vmux_flow_map                                                               flows_;             ///< connection_id -> per-flow receive context (flow v2 only).
+        vmux::unordered_map<uint32_t, uint32_t>                                     tx_flow_seq_;       ///< connection_id -> next per-flow DSN to send (flow v2 only).
+        size_t                                                                      flow_reorder_cap_bytes_ = 0; ///< Per-connection reorder buffer byte cap (from config).
+        uint64_t                                                                    flow_reorder_timeout_   = 0; ///< Per-connection gap wait timeout in ms (from config).
 
         vmux_linklayer_vector                                                       rx_links_;          ///< All link-layer endpoints available for inbound.
         vmux_linklayer_list                                                         tx_links_;          ///< Link-layer endpoints ordered by transmit usage.

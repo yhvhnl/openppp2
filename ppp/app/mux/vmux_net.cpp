@@ -2,6 +2,7 @@
 #include "vmux_net.h"
 #include "vmux_skt.h"
 #include <chrono>
+#include <openssl/crypto.h>
 #include <ppp/diagnostics/Error.h>
 #include <ppp/diagnostics/Telemetry.h>
 
@@ -16,12 +17,155 @@
  */
 
 namespace vmux {
+    /**
+     * @brief Parses a textual MUX scheduler mode.
+     */
+    vmux_net::mux_mode vmux_net::parse_mode(const ppp::string& mode) noexcept {
+        ppp::string value = ppp::ToLower<ppp::string>(ppp::LTrim(ppp::RTrim(mode)));
+        if (value == "flow" || value == "flow-v1" || value == "primary" || value == "primary-link") {
+            return mux_mode_flow;
+        }
+
+        if (value == "balance" || value == "balanced" || value == "lb" || value == "load-balance") {
+            return mux_mode_balance;
+        }
+
+        if (value == "stripe" || value == "striped" || value == "striping") {
+            return mux_mode_stripe;
+        }
+
+        return mux_mode_compat;
+    }
+
+    /**
+     * @brief Maps a wire mode byte to a valid scheduler mode.
+     * @return The mode for known values; mux_mode_compat for anything else.
+     */
+    vmux_net::mux_mode vmux_net::parse_mode_byte(Byte mode_value) noexcept {
+        switch (mode_value) {
+        case mux_mode_flow:
+            return mux_mode_flow;
+        case mux_mode_balance:
+            return mux_mode_balance;
+        case mux_mode_stripe:
+            return mux_mode_stripe;
+        default:
+            return mux_mode_compat;
+        }
+    }
+
+    /**
+     * @brief Returns the stable text name for a scheduler mode.
+     */
+    const char* vmux_net::mode_name(mux_mode mode) noexcept {
+        switch (mode) {
+        case mux_mode_flow:
+            return "flow";
+        case mux_mode_balance:
+            return "balance";
+        case mux_mode_stripe:
+            return "stripe";
+        default:
+            return "compat";
+        }
+    }
+
+    /**
+     * @brief Switches the active scheduler mode at runtime.
+     * @details Must run on the vmux strand. Resets per-mode scheduling state
+     *          (primary link, affinity map, stripe cursor) so the next drain
+     *          re-picks links under the new policy.
+     */
+    void vmux_net::set_mode(mux_mode mode) noexcept {
+        mux_mode normalized = mode;
+        switch (normalized) {
+        case mux_mode_flow:
+        case mux_mode_balance:
+        case mux_mode_stripe:
+            break;
+        default:
+            normalized = mux_mode_compat;
+            break;
+        }
+
+        if (mode_ == normalized) {
+            return;
+        }
+
+        mode_ = normalized;
+        primary_linklayer_.reset();
+        affinity_links_.clear();
+        stripe_cursor_ = 0;
+        ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "scheduler mode switched to %s", mode_name(mode_));
+    }
+
+    /**
+     * @brief Applies the negotiated receiver ordering mode (flow v2).
+     * @details Effective only before the session is established (no hot switch
+     *          between compat and flow-v2). Also latches the per-connection
+     *          reorder bounds from AppConfiguration when entering flow-v2.
+     */
+    void vmux_net::set_ordering_mode(receiver_ordering_mode m) noexcept {
+        if (base_.established_) {
+            return; // session-level, immutable after establishment.
+        }
+
+        receiver_ordering_mode normalized = (m == ordering_flow_v2) ? ordering_flow_v2 : ordering_compat;
+        ordering_mode_ = normalized;
+
+        if (normalized == ordering_flow_v2) {
+            // Latch bounded-reorder limits from config (AppConfiguration is set
+            // by the exchanger before establishment); fall back to safe defaults.
+            int cap_bytes = (NULLPTR != AppConfiguration) ? AppConfiguration->mux.flow.reorder.bytes : 0;
+            int timeout_ms = (NULLPTR != AppConfiguration) ? AppConfiguration->mux.flow.reorder.timeout : 0;
+            flow_reorder_cap_bytes_ = (cap_bytes > 0) ? (size_t)cap_bytes : (size_t)PPP_MUX_FLOW_REORDER_BYTES;
+            flow_reorder_timeout_   = (timeout_ms > 0) ? (uint64_t)timeout_ms : (uint64_t)PPP_MUX_FLOW_REORDER_TIMEOUT;
+        }
+
+        ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "ordering mode=%s",
+            normalized == ordering_flow_v2 ? "flow-v2" : "compat");
+    }
+
+    /**
+     * @brief Debug-only wire payload for cmd_mux_mode_set.
+     *
+     * Layout: [mode:1][key_len:1][key:key_len]. The key authorizes the change;
+     * the receiver applies the mode only when the key matches its own non-empty
+     * mux.debug.key. No new per-frame header field is introduced.
+     */
+    bool vmux_net::post_mux_mode_set(mux_mode mode) noexcept {
+        if (NULLPTR == AppConfiguration) {
+            return false;
+        }
+
+        const ppp::string& debug_key = AppConfiguration->mux.debug.key;
+        if (debug_key.empty()) {
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set ignored: no local debug key configured");
+            return false;
+        }
+
+        size_t key_length = debug_key.size();
+        if (key_length > 255) {
+            key_length = 255;
+        }
+
+        ppp::vector<Byte> payload(2 + key_length);
+        payload[0] = static_cast<Byte>(mode);
+        payload[1] = static_cast<Byte>(key_length);
+        if (key_length > 0) {
+            memcpy(payload.data() + 2, debug_key.data(), key_length);
+        }
+
+        ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set requesting peer mode=%s", mode_name(mode));
+        return post(cmd_mux_mode_set, payload.data(), static_cast<int>(payload.size()), 0);
+    }
+
     using ppp::telemetry::Level;
 
     /**
      * @brief Constructs a vmux network core with runtime mode/capacity settings.
      */
-    vmux_net::vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration) noexcept {
+    vmux_net::vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration, mux_mode mode) noexcept {
         assert(max_connections > 0 && "The value of max_connections must be greater than 0.");
 
         vmux_net* const m             = this;
@@ -39,6 +183,18 @@ namespace vmux {
         m->status_.rx_ack_            = 0;
         m->status_.tx_seq_            = 0;
 
+        m->mode_                      = mode;
+        switch (m->mode_) {
+        case mux_mode_flow:
+        case mux_mode_balance:
+        case mux_mode_stripe:
+            break;
+        default:
+            m->mode_                  = mux_mode_compat;
+            break;
+        }
+
+        ppp::telemetry::Log(Level::kInfo, "mux", "mode=%s", mode_name(m->mode_));
         uint64_t now                  = now_tick();
         m->status_.last_              = now;
         m->status_.last_heartbeat_    = now;
@@ -86,6 +242,11 @@ namespace vmux {
             rx_queue_.clear();
             rx_links_.clear();
             tx_links_.clear();
+            primary_linklayer_.reset();
+            affinity_links_.clear();
+            stripe_cursor_ = 0;
+            flows_.clear();
+            tx_flow_seq_.clear();
             break;
         }
 
@@ -184,7 +345,7 @@ namespace vmux {
 
         bool posted = vmux_post_exec(context, strand,
             [self, transmission, context, strand, packet, packet_length, on_completely]() noexcept {
-                bool forwarding = 
+                bool forwarding =
                     transmission->Write(packet.get(), packet_length,
                         [self, context, strand, on_completely](bool ok) noexcept {
                             on_completely(ok);
@@ -237,16 +398,25 @@ namespace vmux {
                 }
 
                 if (ok) {
-                    tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
-                    tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
-                    if (packet_tail == packet_endl) {
+                    if (mode_ == mux_mode_balance || mode_ == mux_mode_stripe) {
+                        // Policy modes re-select the link per packet: return this
+                        // link's send credit and let the scheduler route the next
+                        // queued frame according to affinity / round-robin.
                         tx_links_.emplace_back(linklayer);
+                        ok = process_tx_all_packets();
                     }
                     else {
-                        tx_packet packet = *packet_tail;
-                        tx_queue_.erase(packet_tail);
+                        tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
+                        tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
+                        if (packet_tail == packet_endl) {
+                            tx_links_.emplace_back(linklayer);
+                        }
+                        else {
+                            tx_packet packet = *packet_tail;
+                            tx_queue_.erase(packet_tail);
 
-                        ok = underlyin_sent(linklayer, packet.buffer, packet.length, packet.ac);
+                            ok = underlyin_sent(linklayer, packet.buffer, packet.length, packet.ac);
+                        }
                     }
                 }
 
@@ -314,6 +484,45 @@ namespace vmux {
 
                 for (vmux_skt_ptr& skt : release_skts) {
                     skt->close();
+                }
+
+                /**
+                 * @brief Debug-only one-shot mux-mode push.
+                 *
+                 * Once the session is established, if a transient
+                 * `--mux-mode-set` request and a non-empty `--debug-key` are
+                 * configured locally, push the requested scheduler mode to the
+                 * peer exactly once. The peer applies it only when its own
+                 * debug key matches (see packet_input_mux_mode_set).
+                 */
+                if (base_.established_ && !mux_mode_set_pushed_ && NULLPTR != AppConfiguration) {
+                    const ppp::string& set_mode = AppConfiguration->mux.debug.set_mode;
+                    if (!set_mode.empty() && !AppConfiguration->mux.debug.key.empty()) {
+                        if (post_mux_mode_set(parse_mode(set_mode))) {
+                            mux_mode_set_pushed_ = true;
+                        }
+                    }
+                    else {
+                        mux_mode_set_pushed_ = true; // Nothing to push; do not re-check every tick.
+                    }
+                }
+
+                /**
+                 * @brief Scheduler observability (Phase 2 telemetry):
+                 * publish the active scheduler mode together with the transmit
+                 * queue depth, the out-of-order reorder queue depth, and the
+                 * number of attached link-layers. These run on the vmux strand,
+                 * so reading the queues/link containers here is race-free.
+                 */
+                if (!base_.disposed_) {
+                    // flow-v2: advance any per-connection gap whose wait timed out so a
+                    // permanently lost frame cannot stall that connection's delivery.
+                    flow_evict_expired(now);
+
+                    ppp::telemetry::Gauge("mux.sched.mode", static_cast<int64_t>(mode_));
+                    ppp::telemetry::Gauge("mux.tx.queue.depth", static_cast<int64_t>(tx_queue_.size()));
+                    ppp::telemetry::Gauge("mux.rx.reorder.depth", static_cast<int64_t>(rx_queue_.size()));
+                    ppp::telemetry::Gauge("mux.link.count", static_cast<int64_t>(rx_links_.size()));
                 }
             });
 
@@ -506,12 +715,371 @@ namespace vmux {
         elif(cmd == cmd_keep_alived) {
             active(now);
         }
+        elif(cmd == cmd_mux_mode_set) {
+            packet_input_mux_mode_set(buffer, buffer_size);
+            active(now);
+        }
         else {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolPacketActionInvalid);
             return false;
         }
 
         return true;
+    }
+
+    /**
+     * @brief Handles a debug-only cmd_mux_mode_set control frame.
+     *
+     * Applies the requested scheduler mode only when remote control is enabled
+     * locally (non-empty mux.debug.key) and the key carried in the frame matches
+     * exactly. Mismatches are logged and ignored; the session is never closed,
+     * so a malformed/forged frame cannot disrupt traffic.
+     */
+    void vmux_net::packet_input_mux_mode_set(const Byte* buffer, int buffer_size) noexcept {
+        if (NULLPTR == AppConfiguration) {
+            return;
+        }
+
+        const ppp::string& debug_key = AppConfiguration->mux.debug.key;
+        if (debug_key.empty()) {
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set rejected: remote control disabled (no debug key)");
+            return;
+        }
+
+        if (NULLPTR == buffer || buffer_size < 2) {
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set rejected: malformed control frame");
+            return;
+        }
+
+        Byte requested = buffer[0];
+        int key_length = static_cast<int>(buffer[1]);
+        if (key_length <= 0 || (2 + key_length) > buffer_size) {
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set rejected: invalid key length");
+            return;
+        }
+
+        bool key_matched =
+            key_length == static_cast<int>(debug_key.size()) &&
+            CRYPTO_memcmp(buffer + 2, debug_key.data(), key_length) == 0;
+        if (!key_matched) {
+            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set rejected: debug key mismatch");
+            return;
+        }
+
+        mux_mode mode = parse_mode_byte(requested);
+        ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux", "mux-mode-set accepted from peer: mode=%s", mode_name(mode));
+
+        // Apply to the live session and record a lock-free runtime override on the
+        // shared runtime config so the change survives mux session rebuilds (link
+        // flap, idle/heartbeat timeout). The exchanger reconstructs a vmux_net via
+        // AppConfiguration->GetEffectiveMuxMode() on reconnect; without this the
+        // pushed mode would be lost and silently revert to the configured value.
+        // A plain atomic is used (not the mux.mode string) to avoid a data race
+        // with the exchanger thread that reads the mode during rebuilds.
+        AppConfiguration->SetMuxModeRuntimeOverride(static_cast<int>(mode));
+        set_mode(mode);
+    }
+
+    /**
+     * @brief Delivers one framed data packet (push/fin) to its logical connection.
+     * @details Mirrors the per-command routing of packet_input() for the two
+     *          per-flow data commands. cmd_push forwards the payload; cmd_fin
+     *          delivers an end-of-stream (NULL payload) to the connection.
+     */
+    bool vmux_net::deliver_one(Byte cmd, vmux_hdr* h, int length, uint64_t now) noexcept {
+        int buffer_size = length - (int)sizeof(vmux_hdr);
+        if (buffer_size < 0) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid);
+            return false;
+        }
+
+        Byte* payload = (Byte*)(h + 1);
+        uint32_t connection_id = ntohl(h->connection_id);
+        if (cmd == cmd_push) {
+            packet_input_read(connection_id, payload, buffer_size, now);
+        }
+        else { // cmd_fin
+            packet_input_read(connection_id, NULLPTR, 0, now);
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Releases a flow context once its FIN has been delivered and drained.
+     */
+    void vmux_net::maybe_release_flow(uint32_t connection_id, flow_rx_context& fx) noexcept {
+        if (fx.fin_seen_ && fx.flow_reorder_.empty()) {
+            flows_.erase(connection_id);
+            tx_flow_seq_.erase(connection_id);
+        }
+    }
+
+    /**
+     * @brief Skips the current gap of one flow and replays contiguous buffered frames.
+     * @details Advances flow_rx_next_ to the smallest buffered DSN (acknowledging
+     *          the gap data as lost), then replays the contiguous run from there.
+     *          Used both on reorder-buffer overflow and on gap timeout. Each call
+     *          that actually skips increments the mux.rx.flow.evict telemetry once.
+     */
+    void vmux_net::flow_force_advance(uint32_t connection_id, flow_rx_context& fx, uint64_t now) noexcept {
+        rx_packet_ssqueue::iterator it = fx.flow_reorder_.begin();
+        if (it == fx.flow_reorder_.end()) {
+            fx.oldest_buffered_tick_ = 0;
+            return;
+        }
+
+        fx.flow_rx_next_ = it->first; // jump over the missing gap to the next buffered DSN.
+        ppp::telemetry::Count("mux.rx.flow.evict", 1);
+
+        for (;;) {
+            rx_packet_ssqueue::iterator j = fx.flow_reorder_.begin();
+            if (j != fx.flow_reorder_.end() && j->first == fx.flow_rx_next_) {
+                rx_packet pk = j->second;
+                vmux_hdr* ph = (vmux_hdr*)pk.buffer.get();
+                Byte pcmd = ph->cmd;
+                fx.flow_reorder_.erase(j);
+                fx.buffered_bytes_ -= pk.length;
+                if (pcmd == cmd_fin) {
+                    fx.fin_seen_ = true;
+                }
+                deliver_one(pcmd, ph, pk.length, now);
+                fx.flow_rx_next_++;
+            }
+            else {
+                break;
+            }
+        }
+
+        fx.oldest_buffered_tick_ = fx.flow_reorder_.empty() ? 0 : now;
+    }
+
+    /**
+     * @brief Per-flow (flow v2) receive path: independent per-connection DSN delivery.
+     * @details Control frames bypass the DSN gate entirely. Per-flow data frames
+     *          (push/fin) are delivered in per-connection DSN order, buffering
+     *          future frames in a bounded reorder buffer. One slow link cannot
+     *          head-of-line block other connections because each connection_id
+     *          has its own flow_rx_next_ and reorder buffer.
+     */
+    bool vmux_net::packet_input_flow(const vmux_linklayer_ptr& linklayer, vmux_hdr* h, int length, uint64_t now) noexcept {
+        if (base_.disposed_) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
+            return false;
+        }
+
+        ppp::telemetry::Count("mux.link.recv", 1);
+
+        Byte cmd = h->cmd;
+
+        // Control frames are not gated by any per-flow DSN; handle them inline.
+        if (is_session_control(cmd) || is_connection_control(cmd)) {
+            if (!packet_input(cmd, (Byte*)h, length, now)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolPacketActionInvalid);
+                return false;
+            }
+
+            active(now);
+            linklayer_update(linklayer);
+            return true;
+        }
+
+        // Any other non per-flow-data command is invalid on the flow path.
+        if (!is_per_flow_data(cmd)) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolPacketActionInvalid);
+            return false;
+        }
+
+        uint32_t cid = ntohl(h->connection_id);
+        uint32_t seq = ntohl(h->seq);
+
+        flow_rx_context& fx = flows_[cid];
+        if (!fx.primed_) {
+            fx.primed_ = true;
+            fx.flow_rx_next_ = seq; // prime from the first observed DSN.
+        }
+
+        if (seq == fx.flow_rx_next_) {
+            // In-order: deliver immediately, then replay any contiguous buffered frames.
+            if (cmd == cmd_fin) {
+                fx.fin_seen_ = true;
+            }
+
+            if (!deliver_one(cmd, h, length, now)) {
+                return false;
+            }
+            fx.flow_rx_next_++;
+
+            for (;;) {
+                rx_packet_ssqueue::iterator it = fx.flow_reorder_.begin();
+                if (it != fx.flow_reorder_.end() && it->first == fx.flow_rx_next_) {
+                    rx_packet pk = it->second;
+                    vmux_hdr* ph = (vmux_hdr*)pk.buffer.get();
+                    Byte pcmd = ph->cmd;
+                    fx.flow_reorder_.erase(it);
+                    fx.buffered_bytes_ -= pk.length;
+                    if (pcmd == cmd_fin) {
+                        fx.fin_seen_ = true;
+                    }
+                    if (!deliver_one(pcmd, ph, pk.length, now)) {
+                        return false;
+                    }
+                    fx.flow_rx_next_++;
+                }
+                else {
+                    break;
+                }
+            }
+
+            if (fx.flow_reorder_.empty()) {
+                fx.oldest_buffered_tick_ = 0;
+            }
+
+            maybe_release_flow(cid, fx);
+            active(now);
+            linklayer_update(linklayer);
+            return true;
+        }
+        elif(packet_less<uint32_t>::after(seq, fx.flow_rx_next_)) {
+            // Future frame: buffer it (bounded by bytes), unless it is itself too large.
+            if (length < (int)sizeof(vmux_hdr) || length > (int)(sizeof(vmux_hdr) + max_buffers_size)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid);
+                return false;
+            }
+
+            // A single frame larger than the whole per-connection cap can never be
+            // buffered; treat it as a gap and advance past it to preserve the bound.
+            if ((size_t)length > flow_reorder_cap_bytes_) {
+                if (packet_less<uint32_t>::after(seq, fx.flow_rx_next_)) {
+                    // Skip forward to (seq + 1) so we do not wait forever on a frame we cannot hold.
+                    fx.flow_rx_next_ = seq + 1;
+                    // Replay anything now contiguous.
+                    for (;;) {
+                        rx_packet_ssqueue::iterator it = fx.flow_reorder_.begin();
+                        if (it != fx.flow_reorder_.end() && it->first == fx.flow_rx_next_) {
+                            rx_packet pk = it->second;
+                            vmux_hdr* ph = (vmux_hdr*)pk.buffer.get();
+                            Byte pcmd = ph->cmd;
+                            fx.flow_reorder_.erase(it);
+                            fx.buffered_bytes_ -= pk.length;
+                            if (pcmd == cmd_fin) {
+                                fx.fin_seen_ = true;
+                            }
+                            deliver_one(pcmd, ph, pk.length, now);
+                            fx.flow_rx_next_++;
+                        }
+                        else {
+                            break;
+                        }
+                    }
+                    if (fx.flow_reorder_.empty()) {
+                        fx.oldest_buffered_tick_ = 0;
+                    }
+                }
+                active(now);
+                linklayer_update(linklayer);
+                return true;
+            }
+
+            // Evict oldest gaps until this frame fits within the per-connection cap.
+            while (fx.buffered_bytes_ + (size_t)length > flow_reorder_cap_bytes_ && !fx.flow_reorder_.empty()) {
+                flow_force_advance(cid, fx, now);
+                // If forcing advance made seq become the next expected, fall through is
+                // not needed; re-check below by comparing again on next loop iteration.
+                if (seq == fx.flow_rx_next_ || packet_less<uint32_t>::before(seq, fx.flow_rx_next_)) {
+                    break;
+                }
+            }
+
+            // After eviction the frame might now be in-order or stale; re-classify.
+            if (seq == fx.flow_rx_next_) {
+                if (cmd == cmd_fin) {
+                    fx.fin_seen_ = true;
+                }
+                if (!deliver_one(cmd, h, length, now)) {
+                    return false;
+                }
+                fx.flow_rx_next_++;
+                for (;;) {
+                    rx_packet_ssqueue::iterator it = fx.flow_reorder_.begin();
+                    if (it != fx.flow_reorder_.end() && it->first == fx.flow_rx_next_) {
+                        rx_packet pk = it->second;
+                        vmux_hdr* ph = (vmux_hdr*)pk.buffer.get();
+                        Byte pcmd = ph->cmd;
+                        fx.flow_reorder_.erase(it);
+                        fx.buffered_bytes_ -= pk.length;
+                        if (pcmd == cmd_fin) {
+                            fx.fin_seen_ = true;
+                        }
+                        if (!deliver_one(pcmd, ph, pk.length, now)) {
+                            return false;
+                        }
+                        fx.flow_rx_next_++;
+                    }
+                    else {
+                        break;
+                    }
+                }
+                if (fx.flow_reorder_.empty()) {
+                    fx.oldest_buffered_tick_ = 0;
+                }
+                maybe_release_flow(cid, fx);
+                active(now);
+                linklayer_update(linklayer);
+                return true;
+            }
+            elif(packet_less<uint32_t>::before(seq, fx.flow_rx_next_)) {
+                active(now);
+                return true; // became stale after eviction; drop.
+            }
+
+            std::shared_ptr<Byte> buf = make_byte_array(length);
+            if (NULLPTR == buf) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetReorderPacketBufferAllocFailed);
+                return false;
+            }
+
+            rx_packet packet = { buf, length };
+            memcpy(buf.get(), h, length);
+
+            bool inserted = fx.flow_reorder_.emplace(std::make_pair(seq, packet)).second;
+            if (inserted) {
+                fx.buffered_bytes_ += length;
+                if (fx.oldest_buffered_tick_ == 0) {
+                    fx.oldest_buffered_tick_ = now;
+                }
+            }
+            // Duplicate future DSN: keep the original, drop the duplicate, not an error.
+
+            active(now);
+            linklayer_update(linklayer);
+            return true;
+        }
+        else {
+            // Stale/duplicate (before flow_rx_next_): drop, not an error.
+            active(now);
+            return true;
+        }
+    }
+
+    /**
+     * @brief Periodically advances per-flow contexts whose gap has timed out.
+     * @details Runs only under flow-v2. For each flow with a non-empty reorder
+     *          buffer whose oldest buffered frame is older than the timeout, skip
+     *          the missing gap so a permanently lost frame cannot stall the flow.
+     */
+    void vmux_net::flow_evict_expired(uint64_t now) noexcept {
+        if (ordering_mode_ != ordering_flow_v2) {
+            return;
+        }
+
+        for (vmux_flow_map::iterator it = flows_.begin(); it != flows_.end(); ++it) {
+            flow_rx_context& fx = it->second;
+            if (!fx.flow_reorder_.empty() && fx.oldest_buffered_tick_ != 0 &&
+                (now - fx.oldest_buffered_tick_) > flow_reorder_timeout_) {
+                flow_force_advance(it->first, fx, now);
+            }
+        }
     }
     
     /**
@@ -583,6 +1151,9 @@ namespace vmux {
                 skt = tail->second;
                 if (skt.get() == refer_pointer) {
                     skts_.erase(tail);
+                    affinity_links_.erase(connection_id); // drop sticky binding (balance mode)
+                    flows_.erase(connection_id);          // drop per-flow receive context (flow v2)
+                    tx_flow_seq_.erase(connection_id);    // drop per-flow send DSN counter (flow v2)
                 }
             }
         }
@@ -605,7 +1176,29 @@ namespace vmux {
         }
 
         vmux_hdr* h = (vmux_hdr*)packet.get();
-        h->seq = htonl(status_.tx_seq_++);
+        if (ordering_mode_ == ordering_flow_v2) {
+            // flow v2: per-flow data frames carry a per-connection DSN; control
+            // frames carry seq=0 (the receiver ignores their DSN). This keeps the
+            // wire header unchanged while letting the receiver order each
+            // connection independently.
+            Byte cmd = h->cmd;
+            if (is_per_flow_data(cmd)) {
+                uint32_t cid = ntohl(h->connection_id);
+                // Per-connection DSN starts at 1; 0 is reserved as the control-frame
+                // placeholder so a data DSN is never confused with a control frame.
+                uint32_t& dsn = tx_flow_seq_[cid];
+                if (dsn == 0) {
+                    dsn = 1;
+                }
+                h->seq = htonl(dsn++);
+            }
+            else {
+                h->seq = htonl(0);
+            }
+        }
+        else {
+            h->seq = htonl(status_.tx_seq_++);
+        }
 
         if (acceleration && base_.acceleration_) {
             vmux_linklayer_list::iterator linklayer_tail = tx_links_.begin();
@@ -628,8 +1221,36 @@ namespace vmux {
         return process_tx_all_packets();
     }
 
+    /** @brief True when an underlying link-layer endpoint is usable. */
+    bool vmux_net::is_linklayer_active(const vmux_linklayer_ptr& linklayer) noexcept {
+        if (NULLPTR == linklayer) {
+            return false;
+        }
+
+        const VirtualEthernetTcpipConnectionPtr& connection = linklayer->connection;
+        return NULLPTR != connection && connection->IsLinked();
+    }
+
+    /** @brief Picks or refreshes the primary link-layer endpoint for flow mode. */
+    vmux_net::vmux_linklayer_ptr vmux_net::select_primary_linklayer() noexcept {
+        if (is_linklayer_active(primary_linklayer_)) {
+            return primary_linklayer_;
+        }
+
+        primary_linklayer_.reset();
+        for (const vmux_linklayer_ptr& linklayer : rx_links_) {
+            if (is_linklayer_active(linklayer)) {
+                primary_linklayer_ = linklayer;
+                ppp::telemetry::Log(Level::kDebug, "mux", "primary link selected");
+                return primary_linklayer_;
+            }
+        }
+
+        return NULLPTR;
+    }
+
     /** @brief Drains queued packets across currently available transmit linklayers. */
-    bool vmux_net::process_tx_all_packets() noexcept {
+    bool vmux_net::process_tx_compat_packets() noexcept {
         vmux_linklayer_list::iterator linklayer_tail = tx_links_.begin();
         vmux_linklayer_list::iterator linklayer_endl = tx_links_.end();
 
@@ -658,6 +1279,244 @@ namespace vmux {
         return true;
     }
 
+    /** @brief Drains queued packets through the flow primary linklayer. */
+    bool vmux_net::process_tx_flow_packets() noexcept {
+        tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
+        tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
+        if (packet_tail == packet_endl) {
+            return true;
+        }
+
+        vmux_linklayer_ptr linklayer = select_primary_linklayer();
+        if (NULLPTR == linklayer) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
+            return false;
+        }
+
+        vmux_linklayer_list::iterator linklayer_tail = tx_links_.begin();
+        vmux_linklayer_list::iterator linklayer_endl = tx_links_.end();
+        while (linklayer_tail != linklayer_endl && *linklayer_tail != linklayer) {
+            ++linklayer_tail;
+        }
+
+        if (linklayer_tail == linklayer_endl) {
+            return true;
+        }
+
+        tx_links_.erase(linklayer_tail);
+        tx_packet nexting_packet = *packet_tail;
+        tx_queue_.erase(packet_tail);
+
+        bool forwarding = underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac);
+        if (!forwarding) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+            return false;
+        }
+
+        return true;
+    }
+
+    /** @brief Reads the connection_id field stored in a queued vmux frame buffer. */
+    uint32_t vmux_net::peek_connection_id(const std::shared_ptr<Byte>& packet, int packet_length) noexcept {
+        if (NULLPTR == packet || packet_length < (int)sizeof(vmux_hdr)) {
+            return 0;
+        }
+
+        const vmux_hdr* h = (const vmux_hdr*)packet.get();
+        return ntohl(h->connection_id);
+    }
+
+    /**
+     * @brief Picks a least-loaded active link-layer for a new connection.
+     * @details "Load" is approximated by the number of connections currently
+     *          bound to each link in the affinity map; ties keep the first seen.
+     */
+    vmux_net::vmux_linklayer_ptr vmux_net::select_balanced_linklayer() noexcept {
+        vmux_linklayer_ptr best;
+        size_t best_load = 0;
+
+        for (const vmux_linklayer_ptr& linklayer : rx_links_) {
+            if (!is_linklayer_active(linklayer)) {
+                continue;
+            }
+
+            size_t load = 0;
+            for (const std::pair<const uint32_t, vmux_linklayer_ptr>& kv : affinity_links_) {
+                if (kv.second == linklayer) {
+                    load++;
+                }
+            }
+
+            if (NULLPTR == best || load < best_load) {
+                best = linklayer;
+                best_load = load;
+            }
+        }
+
+        return best;
+    }
+
+    /**
+     * @brief Returns the sticky link-layer bound to a connection.
+     * @details Binds the connection to a balanced link on first use, and
+     *          re-binds (migrates) when the previously bound link went away.
+     *          connection_id 0 (session-global control frames) is not pinned.
+     */
+    vmux_net::vmux_linklayer_ptr vmux_net::select_affinity_linklayer(uint32_t connection_id) noexcept {
+        if (connection_id != 0) {
+            auto tail = affinity_links_.find(connection_id);
+            if (tail != affinity_links_.end()) {
+                if (is_linklayer_active(tail->second)) {
+                    return tail->second;
+                }
+
+                affinity_links_.erase(tail); // bound link is gone; migrate below.
+            }
+        }
+
+        vmux_linklayer_ptr linklayer = select_balanced_linklayer();
+        if (NULLPTR != linklayer && connection_id != 0) {
+            affinity_links_[connection_id] = linklayer;
+        }
+
+        return linklayer;
+    }
+
+    /** @brief Picks the next active link-layer round-robin for stripe mode. */
+    vmux_net::vmux_linklayer_ptr vmux_net::select_striped_linklayer() noexcept {
+        size_t count = rx_links_.size();
+        if (count == 0) {
+            return NULLPTR;
+        }
+
+        for (size_t i = 0; i < count; i++) {
+            const vmux_linklayer_ptr& linklayer = rx_links_[stripe_cursor_ % count];
+            stripe_cursor_++;
+            if (is_linklayer_active(linklayer)) {
+                return linklayer;
+            }
+        }
+
+        return NULLPTR;
+    }
+
+    /**
+     * @brief Per-packet policy drain shared notes (balance/stripe).
+     * @details Unlike compat/flow which drive from the free-link list, these
+     *          modes drive from the packet queue and pick the link per packet
+     *          (affinity for balance, round-robin for stripe). A link is removed
+     *          from tx_links_ (marked busy) before the async write; the
+     *          completion in underlyin_sent re-credits the link and re-runs the
+     *          scheduler so the next frame is routed by policy again.
+     *
+     *          NOTE: this is a send-side policy only. The protocol still uses a
+     *          single global tx_seq_/rx_ack_, so the receiver delivers in global
+     *          order; balance/stripe improve link utilization but do not remove
+     *          receiver-side head-of-line blocking (see issue #5 design notes).
+     */
+    /** @brief Drains queued packets with per-connection sticky link selection (balance). */
+    bool vmux_net::process_tx_balance_packets() noexcept {
+        for (;;) {
+            tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
+            if (packet_tail == tx_queue_.end()) {
+                return true;
+            }
+
+            // Only dispatch while at least one link has send credit available.
+            if (tx_links_.empty()) {
+                return true;
+            }
+
+            uint32_t connection_id = peek_connection_id(packet_tail->buffer, packet_tail->length);
+            vmux_linklayer_ptr linklayer = select_affinity_linklayer(connection_id);
+            if (NULLPTR == linklayer) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
+                return false;
+            }
+
+            // Honor the credit scheme: only send now if the chosen link is free.
+            // Otherwise leave the frame queued; a free link's completion will
+            // re-drive process_tx_all_packets and pick it up shortly.
+            vmux_linklayer_list::iterator link_tail = tx_links_.begin();
+            vmux_linklayer_list::iterator link_endl = tx_links_.end();
+            while (link_tail != link_endl && *link_tail != linklayer) {
+                ++link_tail;
+            }
+
+            if (link_tail == link_endl) {
+                // Sticky link is busy; fall back to any free link to avoid stalling
+                // throughput. Correctness is preserved by the global sequence number.
+                linklayer = *tx_links_.begin();
+                link_tail = tx_links_.begin();
+            }
+
+            tx_links_.erase(link_tail);
+
+            tx_packet nexting_packet = *packet_tail;
+            tx_queue_.erase(packet_tail);
+
+            if (!underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                return false;
+            }
+        }
+    }
+
+    /** @brief Drains queued packets striped round-robin across links (stripe). */
+    bool vmux_net::process_tx_stripe_packets() noexcept {
+        for (;;) {
+            tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
+            if (packet_tail == tx_queue_.end()) {
+                return true;
+            }
+
+            if (tx_links_.empty()) {
+                return true;
+            }
+
+            // Prefer the round-robin target when it currently has send credit;
+            // otherwise use any free link so a busy target does not stall output.
+            vmux_linklayer_ptr preferred = select_striped_linklayer();
+            vmux_linklayer_list::iterator link_tail = tx_links_.end();
+            if (NULLPTR != preferred) {
+                for (auto it = tx_links_.begin(); it != tx_links_.end(); ++it) {
+                    if (*it == preferred) {
+                        link_tail = it;
+                        break;
+                    }
+                }
+            }
+
+            if (link_tail == tx_links_.end()) {
+                link_tail = tx_links_.begin();
+            }
+
+            vmux_linklayer_ptr linklayer = *link_tail;
+            tx_links_.erase(link_tail);
+
+            tx_packet nexting_packet = *packet_tail;
+            tx_queue_.erase(packet_tail);
+
+            if (!underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                return false;
+            }
+        }
+    }
+
+    /** @brief Drains queued packets according to selected scheduler mode. */
+    bool vmux_net::process_tx_all_packets() noexcept {
+        switch (mode_) {
+        case mux_mode_flow:
+            return process_tx_flow_packets();
+        case mux_mode_balance:
+            return process_tx_balance_packets();
+        case mux_mode_stripe:
+            return process_tx_stripe_packets();
+        default:
+            return process_tx_compat_packets();
+        }
+    }
     /**
      * @brief Builds a vmux frame from command/payload and schedules transmit.
      */
@@ -941,7 +1800,10 @@ namespace vmux {
             bool posted = vmux_post_exec(context_, strand_,
                 [self, this, linklayer, buffer_memory, h, buffer_size]() noexcept {
                     uint64_t now = now_tick();
-                    if (packet_input_unorder(linklayer, h, buffer_size, now)) {
+                    bool delivered = (ordering_mode_ == ordering_flow_v2)
+                        ? packet_input_flow(linklayer, h, buffer_size, now)
+                        : packet_input_unorder(linklayer, h, buffer_size, now);
+                    if (delivered) {
                         return true;
                     }
                     else {
