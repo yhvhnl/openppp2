@@ -58,7 +58,22 @@ OPTION(ENABLE_SYSNAT "Enable SYSNAT kernel-bypass traffic control (Linux only)" 
 IF(ENABLE_SYSNAT)
     ADD_DEFINITIONS(-DSYSNAT)
 ENDIF()
-ADD_DEFINITIONS(-DJEMALLOC)
+
+# Diagnostic-only AddressSanitizer build (default OFF). When enabled on a
+# non-MSVC toolchain it (1) drops jemalloc so ASan's allocator interceptors are
+# actually in effect (jemalloc would otherwise take over malloc/free and hide
+# heap errors), and (2) relaxes the fully-static link below so libasan can be
+# linked. NEVER ship an ASan build to production; it is for reproducing the
+# vmux teardown heap-corruption only.
+OPTION(ENABLE_ASAN "Build with AddressSanitizer (diagnostic only; disables jemalloc)" OFF)
+IF(ENABLE_ASAN AND NOT MSVC)
+    SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer -g")
+ENDIF()
+
+IF(NOT ENABLE_ASAN)
+    ADD_DEFINITIONS(-DJEMALLOC)
+ENDIF()
 ADD_DEFINITIONS(-DFUNCTION)
 ADD_DEFINITIONS(-DBUDDY_ALLOC_IMPLEMENTATION)
 
@@ -252,7 +267,13 @@ ELSE()
     # When the __MUSL__ macro is enabled and compilation errors are encountered, you can add the connector option: -static
     # -rdynamic -Wl,-Bstatic -Wl,-Bdynamic -lstdc++ -lpthread -ldl -lz -lrt
     IF(NOT MSVC)
-        SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -rdynamic -Wl,-Bstatic") 
+        IF(ENABLE_ASAN)
+            # ASan needs its runtime dynamically linked; do not force -Bstatic
+            # and add the sanitizer to the link line.
+            SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -rdynamic -fsanitize=address")
+        ELSE()
+            SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -rdynamic -Wl,-Bstatic") 
+        ENDIF()
     ENDIF()
 ENDIF()
 
@@ -471,24 +492,45 @@ ELSEIF(PLATFORM_COMPILER_CLANG)
     ENDIF()
     TARGET_LINK_LIBRARIES(${NAME} ${PPP_CLANG_LINK_LIBS})
 ELSEIF(NOT MSVC)
-    SET(PPP_LINUX_LINK_LIBS
-        libc.a
-        libssl.a
-        libcrypto.a
-        libjemalloc.a
-        m
-        unwind
-        atomic
-        stdc++
-        rt
-        dl
-        pthread
-        libboost_system.a
-        libboost_coroutine.a
-        libboost_thread.a
-        libboost_context.a
-        libboost_regex.a
-        libboost_filesystem.a)
+    IF(ENABLE_ASAN)
+        # ASan variant: drop libc.a (no full-static libc) and libjemalloc.a (let
+        # ASan's allocator intercept malloc/free). Diagnostic build only.
+        SET(PPP_LINUX_LINK_LIBS
+            libssl.a
+            libcrypto.a
+            m
+            unwind
+            atomic
+            stdc++
+            rt
+            dl
+            pthread
+            libboost_system.a
+            libboost_coroutine.a
+            libboost_thread.a
+            libboost_context.a
+            libboost_regex.a
+            libboost_filesystem.a)
+    ELSE()
+        SET(PPP_LINUX_LINK_LIBS
+            libc.a
+            libssl.a
+            libcrypto.a
+            libjemalloc.a
+            m
+            unwind
+            atomic
+            stdc++
+            rt
+            dl
+            pthread
+            libboost_system.a
+            libboost_coroutine.a
+            libboost_thread.a
+            libboost_context.a
+            libboost_regex.a
+            libboost_filesystem.a)
+    ENDIF()
     IF(ENABLE_IO_URING)
         LIST(APPEND PPP_LINUX_LINK_LIBS uring)
     ENDIF()
