@@ -113,6 +113,15 @@ namespace vmux {
         receiver_ordering_mode normalized = (m == ordering_flow_v2) ? ordering_flow_v2 : ordering_compat;
         ordering_mode_ = normalized;
 
+        // Latch send-side backpressure / watchdog bounds from config (applies to
+        // all modes; AppConfiguration is set by the exchanger before establishment).
+        if (NULLPTR != AppConfiguration) {
+            int qmax = AppConfiguration->mux.tx.queue.max;
+            int qstall = AppConfiguration->mux.tx.queue.stall;
+            tx_queue_high_water_ = (qmax > 0) ? (size_t)qmax : (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER;
+            tx_backlog_stall_ms_ = (qstall > 0) ? (uint64_t)qstall : (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT;
+        }
+
         if (normalized == ordering_flow_v2) {
             // Latch bounded-reorder limits from config (AppConfiguration is set
             // by the exchanger before establishment); fall back to safe defaults.
@@ -544,14 +553,14 @@ namespace vmux {
                     // their own priority queue, so this only triggers on a genuine
                     // data-path wedge.
                     size_t tx_depth = tx_queue_.size();
-                    if (tx_depth >= (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER) {
+                    if (tx_depth >= tx_queue_high_water_) {
                         if (tx_backlog_since_ == 0) {
                             tx_backlog_since_ = now;
                         }
-                        elif((now - tx_backlog_since_) >= (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT) {
+                        elif((now - tx_backlog_since_) >= tx_backlog_stall_ms_) {
                             ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux",
                                 "tx backlog stall watchdog: depth=%d held >= %dms, rebuilding session",
-                                (int)tx_depth, PPP_MUX_TX_BACKLOG_STALL_TIMEOUT);
+                                (int)tx_depth, (int)tx_backlog_stall_ms_);
                             ppp::telemetry::Count("mux.tx.backlog.stall", 1);
                             close_exec();
                         }
@@ -1267,7 +1276,7 @@ namespace vmux {
                 // to attaching the completion to the frame so it fires only when the
                 // frame is actually sent — this re-couples the read-pump to drain
                 // progress and throttles ingestion until the backlog clears.
-                bool throttle = tx_queue_.size() >= (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER;
+                bool throttle = tx_queue_.size() >= tx_queue_high_water_;
                 if (throttle) {
                     tx_queue_.emplace_back(tx_packet{ packet, packet_length, posted_ac });
                 }

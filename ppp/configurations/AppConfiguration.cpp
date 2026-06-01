@@ -292,6 +292,8 @@ namespace ppp {
             config.mux.flow_v2 = false;
             config.mux.flow.reorder.bytes = PPP_MUX_FLOW_REORDER_BYTES;
             config.mux.flow.reorder.timeout = PPP_MUX_FLOW_REORDER_TIMEOUT;
+            config.mux.tx.queue.max = PPP_MUX_TX_QUEUE_HIGH_WATER;
+            config.mux.tx.queue.stall = PPP_MUX_TX_BACKLOG_STALL_TIMEOUT;
             config.mux.debug.key = "";
             config.mux.debug.set_mode = "";
 
@@ -698,6 +700,14 @@ namespace ppp {
 
             if (config.mux.flow.reorder.timeout <= 0) {
                 config.mux.flow.reorder.timeout = PPP_MUX_FLOW_REORDER_TIMEOUT;
+            }
+
+            if (config.mux.tx.queue.max <= 0) {
+                config.mux.tx.queue.max = PPP_MUX_TX_QUEUE_HIGH_WATER;
+            }
+
+            if (config.mux.tx.queue.stall <= 0) {
+                config.mux.tx.queue.stall = PPP_MUX_TX_BACKLOG_STALL_TIMEOUT;
             }
 
             if (config.udp.static_.aggligator < 0) {
@@ -1612,6 +1622,8 @@ namespace ppp {
             config.mux.flow_v2 = JsonAuxiliary::AsValue<bool>(json["mux"]["flow-v2"]);
             config.mux.flow.reorder.bytes = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["bytes"]);
             config.mux.flow.reorder.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["timeout"]);
+            config.mux.tx.queue.max = JsonAuxiliary::AsValue<int>(json["mux"]["tx"]["queue"]["max"]);
+            config.mux.tx.queue.stall = JsonAuxiliary::AsValue<int>(json["mux"]["tx"]["queue"]["stall"]);
             config.mux.debug.key = JsonAuxiliary::AsValue<ppp::string>(json["mux"]["debug"]["key"]);
             config.mux.keep_alived[0] = JsonAuxiliary::AsValue<int>(json["mux"]["keep-alived"][0]);
             config.mux.keep_alived[1] = JsonAuxiliary::AsValue<int>(json["mux"]["keep-alived"][1]);
@@ -1918,6 +1930,8 @@ namespace ppp {
             mux["flow-v2"] = config.mux.flow_v2;
             mux["flow"]["reorder"]["bytes"] = config.mux.flow.reorder.bytes;
             mux["flow"]["reorder"]["timeout"] = config.mux.flow.reorder.timeout;
+            mux["tx"]["queue"]["max"] = config.mux.tx.queue.max;
+            mux["tx"]["queue"]["stall"] = config.mux.tx.queue.stall;
             if (!config.mux.debug.key.empty()) {
                 mux["debug"]["key"] = config.mux.debug.key;
             }
