@@ -294,10 +294,16 @@ Set `mux.mode` in JSON or pass `--mux-mode=flow` at startup (CLI overrides JSON)
 ### `--mux-mode-turbo=[yes|no]`
 
 flow-mode turbo (opt-in, default `no`; only meaningful under `--mux-mode=flow`). Sends a
-new connection's first packet over the currently best-quality carrier link (by heartbeat
-signal) and prewarms additional carrier links in the background to widen the competition
-pool — improving first-byte latency without pinning connections to links. Set `mux.turbo`
-in JSON or pass `--mux-mode-turbo=yes`.
+new connection's first packet over the most-recently-active carrier link (an approximate
+"best link" by recency of inbound traffic — **not** an RTT measurement; it reuses existing
+per-link activity and adds no control frames) to cut first-byte latency. The connection is
+**not** bound to that link — every later frame returns to the normal competition pool.
+Set `mux.turbo` in JSON or pass `--mux-mode-turbo=yes`.
+
+> Background carrier prewarming (opening extra carrier TCP to widen the competition pool)
+> is part of the turbo design but is **not yet implemented** — it depends on the mux
+> session lifecycle (teardown) hardening still in progress. Today turbo = best-link-first
+> first packet only.
 
 **Default:** `no`
 

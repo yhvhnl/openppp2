@@ -120,6 +120,8 @@ namespace vmux {
             int qstall = AppConfiguration->mux.tx.queue.stall;
             tx_queue_high_water_ = (qmax > 0) ? (size_t)qmax : (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER;
             tx_backlog_stall_ms_ = (qstall > 0) ? (uint64_t)qstall : (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT;
+            // flow turbo: only meaningful under flow mode; harmless to latch always.
+            turbo_ = AppConfiguration->mux.turbo && (mode_ == mux_mode_flow);
         }
 
         if (normalized == ordering_flow_v2) {
@@ -1260,6 +1262,30 @@ namespace vmux {
             return process_tx_all_packets();
         }
 
+        // flow turbo: a new connection's first packet (cmd_syn) is sent over the
+        // most-recently-active link to cut first-byte latency. This is a one-shot
+        // hint only — the connection is NOT bound; all subsequent frames go through
+        // the normal competition drain. Recency is an approximate signal (not RTT);
+        // fail-open to competition when no turbo link is available or the link has
+        // no send credit.
+        if (turbo_ && h->cmd == cmd_syn) {
+            vmux_linklayer_ptr turbo_link = select_turbo_linklayer();
+            if (NULLPTR != turbo_link) {
+                vmux_linklayer_list::iterator lt = tx_links_.begin();
+                vmux_linklayer_list::iterator le = tx_links_.end();
+                while (lt != le && *lt != turbo_link) {
+                    ++lt;
+                }
+
+                if (lt != le) {
+                    tx_links_.erase(lt);
+                    ppp::telemetry::Count("mux.turbo.syn", 1);
+                    return underlyin_sent(turbo_link, packet, packet_length, posted_ac);
+                }
+            }
+            // fall through to the normal path when no free turbo link is available.
+        }
+
         if (acceleration && base_.acceleration_) {
             vmux_linklayer_list::iterator linklayer_tail = tx_links_.begin();
             vmux_linklayer_list::iterator linklayer_endl = tx_links_.end();
@@ -1448,6 +1474,30 @@ namespace vmux {
         }
 
         return NULLPTR;
+    }
+
+    /** @brief Picks the most-recently-active link for a turbo first packet. */
+    vmux_net::vmux_linklayer_ptr vmux_net::select_turbo_linklayer() noexcept {
+        // Approximate "best link" = the active link that most recently carried
+        // inbound traffic (largest last_active_). This is a recency heuristic, not
+        // an RTT measurement: it reuses the per-link activity we already stamp in
+        // linklayer_update(), adds no control frames, and is only a hint for the
+        // first packet (the connection is never bound here). Fail-open: if none
+        // qualifies, the caller falls back to the normal competition drain.
+        vmux_linklayer_ptr best;
+        uint64_t best_tick = 0;
+        for (const vmux_linklayer_ptr& linklayer : rx_links_) {
+            if (!is_linklayer_active(linklayer)) {
+                continue;
+            }
+
+            if (NULLPTR == best || linklayer->last_active_ >= best_tick) {
+                best = linklayer;
+                best_tick = linklayer->last_active_;
+            }
+        }
+
+        return best;
     }
 
     /**
@@ -1878,6 +1928,13 @@ namespace vmux {
 
     /** @brief Refreshes activity on the underlying linklayer connection. */
     void vmux_net::linklayer_update(const vmux_linklayer_ptr& linklayer) noexcept {
+        if (NULLPTR != linklayer) {
+            // Stamp the most-recent-inbound tick used by turbo's approximate
+            // best-link selection (recency, not RTT). Strand-affine: called from
+            // the vmux strand on every inbound frame.
+            linklayer->last_active_ = now_tick();
+        }
+
         VirtualEthernetTcpipConnectionPtr& connection = linklayer->connection;
         if (connection->IsLinked()) {
             connection->Update();

@@ -57,6 +57,11 @@ turbo must **conform to the competition model** and must not reintroduce the ant
 - **Prewarm carriers**: asynchronously open additional carrier TCP in the background; once ready they **join the competition pool** (more links to compete), with **no** connection migration (migration needs ≥2 RTT and is unreliable).
 - Goal: latency first, throughput second (75–95%). No connection splitting (cannot avoid the race).
 
+### turbo implementation status
+
+- **Best-link-first first packet — implemented** (commit pending): `vmux_linklayer.last_active_` is stamped in `linklayer_update()` on every inbound frame; `select_turbo_linklayer()` picks the most-recently-active live link; `post_internal` routes a `cmd_syn` over it when `mux.turbo` is on and flow mode is active, **without binding** (later frames compete normally). The signal is recency, not RTT — deliberately approximate, zero extra control frames. Fail-open to competition when no free turbo link exists.
+- **Background carrier prewarming — deferred**: requires runtime dynamic `add_linklayer`, which intersects the unfinished teardown lifecycle (D1/D2/D3). Will be implemented after the lifecycle hardening (C2/C3) lands.
+
 ---
 
 ## Defect ledger

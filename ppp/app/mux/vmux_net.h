@@ -53,6 +53,7 @@ namespace vmux {
             VirtualEthernetTcpipConnectionPtr                                       connection;
             std::shared_ptr<
                 ppp::app::server::VirtualEthernetNetworkTcpipConnection>            server;
+            uint64_t                                                                last_active_ = 0; ///< Tick of the most recent inbound frame on this link; turbo's approximate "best link" signal (recency, NOT RTT). Strand-affine.
         }                                                                           vmux_linklayer;
 
         typedef std::shared_ptr<vmux_linklayer>                                     vmux_linklayer_ptr;
@@ -443,6 +444,13 @@ namespace vmux {
         vmux_linklayer_ptr                                                          select_affinity_linklayer(uint32_t connection_id) noexcept;
         /** @brief Pick the next active link-layer round-robin (stripe distribution). */
         vmux_linklayer_ptr                                                          select_striped_linklayer() noexcept;
+        /** @brief Pick the most-recently-active link for a turbo first packet.
+         *  @details Approximate "best link" by recency of inbound traffic
+         *           (last_active_), NOT RTT — a cheap signal that reuses existing
+         *           per-link activity with no extra control frames. Used only for a
+         *           new connection's first packet under turbo; the connection is NOT
+         *           bound to this link (later frames return to the competition pool). */
+        vmux_linklayer_ptr                                                          select_turbo_linklayer() noexcept;
         /** @brief Read the connection_id stored in a queued vmux frame buffer. */
         static uint32_t                                                             peek_connection_id(const std::shared_ptr<Byte>& packet, int packet_length) noexcept;
 
@@ -557,6 +565,7 @@ namespace vmux {
         uint64_t                                                                    tx_backlog_since_       = 0; ///< Tick the data tx queue first stayed at/over high-water (0 = not backlogged); drives the D11 stall watchdog.
         size_t                                                                      tx_queue_high_water_    = (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER; ///< Data tx-queue high-water depth (from config; D11 backpressure).
         uint64_t                                                                    tx_backlog_stall_ms_    = (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT; ///< Backlog stall timeout in ms (from config; D11 watchdog).
+        bool                                                                        turbo_                  = false; ///< flow-mode turbo enabled (from config; best-link-first first packet).
 
         vmux_linklayer_vector                                                       rx_links_;          ///< All link-layer endpoints available for inbound.
         vmux_linklayer_list                                                         tx_links_;          ///< Link-layer endpoints ordered by transmit usage.
