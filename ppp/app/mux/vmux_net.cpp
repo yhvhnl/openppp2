@@ -172,7 +172,7 @@ namespace vmux {
         m->Vlan                       = 0;
    
         m->base_.server_or_client_    = server_mode;
-        m->base_.disposed_            = false;
+        m->base_.disposed_.store(false, std::memory_order_release);
         m->base_.ftt_                 = false;
         m->base_.established_         = false;
         m->base_.acceleration_        = acceleration;
@@ -226,8 +226,8 @@ namespace vmux {
 
         for (;;) {
             SynchronizationObjectScope __SCOPE__(syncobj_);
-            if (!base_.disposed_) {
-                base_.disposed_ = true;
+            if (!base_.disposed_.load(std::memory_order_acquire)) {
+                base_.disposed_.store(true, std::memory_order_release);
                 status_.last_ = now_tick(); 
             }
 
@@ -287,7 +287,7 @@ namespace vmux {
      */
     bool vmux_net::ftt(uint32_t seq, uint32_t ack) noexcept {
         SynchronizationObjectScope __SCOPE__(syncobj_);
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -372,7 +372,7 @@ namespace vmux {
             return false;
         }
         
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -403,7 +403,7 @@ namespace vmux {
                 // from this strand callback (emplace_back / erase / re-drain) would
                 // race the teardown and operate on freed list nodes. Once disposed,
                 // drop the completion: there is nothing left to schedule.
-                if (base_.disposed_) {
+                if (base_.disposed_.load(std::memory_order_acquire)) {
                     return;
                 }
 
@@ -446,7 +446,7 @@ namespace vmux {
      * @brief Periodically updates timeout state and closes stale sockets.
      */
     bool vmux_net::update() noexcept {
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -530,7 +530,7 @@ namespace vmux {
                  * number of attached link-layers. These run on the vmux strand,
                  * so reading the queues/link containers here is race-free.
                  */
-                if (!base_.disposed_) {
+                if (!base_.disposed_.load(std::memory_order_acquire)) {
                     // flow-v2: advance any per-connection gap whose wait timed out so a
                     // permanently lost frame cannot stall that connection's delivery.
                     flow_evict_expired(now);
@@ -571,7 +571,7 @@ namespace vmux {
      */
     bool vmux_net::packet_input_unorder(const vmux_linklayer_ptr& linklayer, vmux_hdr* h, int length, uint64_t now) noexcept {
         // Prepare the ack frames.
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -879,7 +879,7 @@ namespace vmux {
      *          has its own flow_rx_next_ and reorder buffer.
      */
     bool vmux_net::packet_input_flow(const vmux_linklayer_ptr& linklayer, vmux_hdr* h, int length, uint64_t now) noexcept {
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -1102,7 +1102,7 @@ namespace vmux {
      * @brief Handles remote SYN by creating and accepting a vmux socket instance.
      */
     bool vmux_net::process_rx_connecting(std::shared_ptr<vmux_skt>& skt, uint32_t connection_id, const char* host, int host_size) noexcept {
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -1186,7 +1186,7 @@ namespace vmux {
             return false;
         }
         
-        if (base_.disposed_ || !base_.established_) {
+        if (base_.disposed_.load(std::memory_order_acquire) || !base_.established_) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetPostInternalNotEstablished);
             return false;
         }
@@ -1556,7 +1556,7 @@ namespace vmux {
             return false;
         }
 
-        if (base_.disposed_ || !base_.established_) {
+        if (base_.disposed_.load(std::memory_order_acquire) || !base_.established_) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetPostFrameNotEstablished);
             return false;
         }
@@ -1598,7 +1598,7 @@ namespace vmux {
         }
 
         SynchronizationObjectScope __SCOPE__(syncobj_);
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -1694,7 +1694,7 @@ namespace vmux {
         ppp::telemetry::SpanScope span("mux.link.setup");
         auto setup_started_at = std::chrono::steady_clock::now();
 
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -1780,7 +1780,7 @@ namespace vmux {
      * @brief Runs continuous read/dispatch forwarding on one linklayer.
      */
     bool vmux_net::forwarding(const vmux_linklayer_ptr& linklayer, ppp::coroutines::YieldContext& y) noexcept {
-        if (base_.disposed_) {
+        if (base_.disposed_.load(std::memory_order_acquire)) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
             return false;
         }
@@ -1805,7 +1805,7 @@ namespace vmux {
 
         linklayer_update(linklayer);
         for (;;) {
-            if (base_.disposed_) {
+            if (base_.disposed_.load(std::memory_order_acquire)) {
                 break;
             }
 
@@ -1866,7 +1866,7 @@ namespace vmux {
         const template_string&                               host,
         int                                                  port) noexcept {
 
-        if (base_.disposed_ || !base_.established_) {
+        if (base_.disposed_.load(std::memory_order_acquire) || !base_.established_) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetConnectRequireNotEstablished);
             return false;
         }
@@ -1918,7 +1918,7 @@ namespace vmux {
 
         // Guard Suspend() behind the post result: if the executor is unavailable the
         // lambda (and every ppp::coroutines::asio::R() inside it) will never run, so
-        // calling Suspend() would park the coroutine with no future Resume() â€“ a
+        // calling Suspend() would park the coroutine with no future Resume() â€?a
         // permanent coroutine leak.
         bool posted = vmux_post_exec(context_, strand_,
             [this, sk, host, port, status, context, strand, return_connection, &y]() noexcept {

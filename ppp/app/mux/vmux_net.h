@@ -286,8 +286,8 @@ namespace vmux {
         bool                                                                        post_mux_mode_set(mux_mode mode) noexcept;
         const uint32_t&                                                             get_tx_seq()          noexcept { return status_.tx_seq_; }
         const uint32_t&                                                             get_rx_ack()          noexcept { return status_.rx_ack_; }
-        bool                                                                        is_disposed()         noexcept { return base_.disposed_; }
-        bool                                                                        is_established()      noexcept { return !base_.disposed_ && base_.established_; }
+        bool                                                                        is_disposed()         noexcept { return base_.disposed_.load(std::memory_order_acquire); }
+        bool                                                                        is_established()      noexcept { return !base_.disposed_.load(std::memory_order_acquire) && base_.established_; }
 
         /** @brief Handle fast transport training/control frame. */
         bool                                                                        ftt(uint32_t seq, uint32_t ack) noexcept;
@@ -399,7 +399,7 @@ namespace vmux {
 
         /** @brief Refresh activity timestamp when session is alive. */
         void                                                                        active(uint64_t now) noexcept { 
-            if (!base_.disposed_) {
+            if (!base_.disposed_.load(std::memory_order_acquire)) {
                 status_.last_ = now; 
             }
         }
@@ -487,11 +487,21 @@ namespace vmux {
     private:
         /** @brief Core boolean state flags for vmux session lifecycle. */
         struct {
-            bool                                                                    disposed_          : 1; ///< Set when session is finalized.
             bool                                                                    ftt_               : 1; ///< Fast transport training frame received.
             bool                                                                    established_       : 1; ///< At least one link-layer is established.
             bool                                                                    server_or_client_  : 1; ///< true = server role; false = client role.
             bool                                                                    acceleration_      : 4; ///< Acceleration enabled flags (multi-bit).
+
+            /**
+             * @brief Session-finalized flag (atomic).
+             *
+             * Read from multiple threads (the per-link forwarding strands, the
+             * vmux strand drain, and send/read completion callbacks) and written
+             * by finalize(). Kept as a standalone std::atomic<bool> — NOT a
+             * bit-field — so the teardown guard has a well-defined happens-before
+             * and writing it never read-modify-writes the neighbouring flags.
+             */
+            std::atomic<bool>                                                       disposed_;             ///< Set when session is finalized.
         }                                                                           base_;
 
         /** @brief Runtime counters, sequence values, and heartbeat timestamps. */
