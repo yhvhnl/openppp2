@@ -779,6 +779,16 @@ namespace ppp {
                         }
 
                         if (breaking) {
+                            // turbo dynamic pool: if the quality controller asked to
+                            // grow, connect that many extra carrier links at runtime
+                            // and attach each via add_linklayer_runtime (single-link,
+                            // single forwarding coroutine — never the batch path).
+                            if (mux->is_established()) {
+                                int grow = mux->take_turbo_pending_grow();
+                                if (grow > 0) {
+                                    MuxGrowLinklayers(switcher_->GetBufferAllocator(), mux, grow);
+                                }
+                            }
                             break;
                         }
                     }
@@ -793,6 +803,20 @@ namespace ppp {
                         mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, false, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_LOCAL) != 0, mux_mode);
                         if (NULLPTR == mux) {
                             break;
+                        }
+
+                        // turbo dynamic pool: raise the carrier-link ceiling to
+                        // base * PPP_MUX_TURBO_FACTOR_MAX so the quality controller
+                        // can grow the pool past --tun-mux under poor quality. The
+                        // base (max_connections) is still what is established and
+                        // negotiated on the wire; growth happens at runtime.
+                        if (mux_mode == vmux::vmux_net::mux_mode_flow &&
+                            NULLPTR != configuration && configuration->mux.turbo) {
+                            uint32_t hard = (uint32_t)max_connections * (uint32_t)PPP_MUX_TURBO_FACTOR_MAX;
+                            if (hard > UINT16_MAX) {
+                                hard = UINT16_MAX;
+                            }
+                            mux->set_pool_hard_max((uint16_t)hard);
                         }
                     }
 
@@ -969,6 +993,72 @@ namespace ppp {
                             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
                         }
                         return false;
+                    });
+            }
+
+            /** @brief Connects `count` extra carrier links at runtime (turbo grow, C-B3 caller). */
+            bool VEthernetExchanger::MuxGrowLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux, int count) noexcept {
+                using ppp::app::protocol::VirtualEthernetTcpipConnection;
+
+                if (NULLPTR == mux || count <= 0) {
+                    return false;
+                }
+
+                std::shared_ptr<boost::asio::io_context> context = mux->get_context();
+                if (NULLPTR == context) {
+                    return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::RuntimeIoContextMissing);
+                }
+
+                auto self = shared_from_this();
+                auto strand = mux->get_strand();
+
+                return YieldContext::Spawn(allocator.get(), *context, strand.get(),
+                    [self, this, mux, count, context, strand](YieldContext& y) noexcept -> bool {
+                        // Grow is best-effort and non-fatal: a failed extra link must
+                        // never tear down the established base pool. Stop on the first
+                        // failure and leave the existing links untouched.
+                        const uint32_t& tx_seq = mux->get_tx_seq();
+                        const uint32_t& rx_ack = mux->get_rx_ack();
+
+                        for (int i = 0; i < count; i++) {
+                            if (disposed_.load(std::memory_order_acquire) || mux != mux_ || mux->is_disposed()) {
+                                break;
+                            }
+
+                            // Respect the runtime ceiling.
+                            if (mux->get_max_connections() == 0) {
+                                break;
+                            }
+
+                            ITransmissionPtr transmission = ConnectTransmission(context, strand, y);
+                            if (NULLPTR == transmission) {
+                                break;
+                            }
+
+                            std::shared_ptr<boost::asio::ip::tcp::socket> default_socket;
+                            std::shared_ptr<VirtualEthernetTcpipConnection> connection =
+                                make_shared_object<VirtualEthernetTcpipConnection>(
+                                    mux->AppConfiguration, context, strand, GetId(), default_socket);
+                            if (NULLPTR == connection) {
+                                break;
+                            }
+
+                            if (!connection->ConnectMux(y, transmission, mux->Vlan, rx_ack, tx_seq)) {
+                                break;
+                            }
+
+                            bool bok = mux->do_yield(y,
+                                [self, mux, connection]() noexcept -> bool {
+                                    vmux::vmux_net::vmux_linklayer_ptr linklayer;
+                                    return mux->add_linklayer_runtime(connection, linklayer);
+                                });
+
+                            if (!bok) {
+                                break;
+                            }
+                        }
+
+                        return true;
                     });
             }
 
