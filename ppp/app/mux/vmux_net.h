@@ -332,6 +332,20 @@ namespace vmux {
             vmux_linklayer_ptr&                                                     linklayer) noexcept;
 
         /**
+         * @brief Begin retiring one carrier link at runtime (turbo dynamic pool
+         *        shrink, C-B4). Strand-affine.
+         * @return true when a link was marked for retirement.
+         * @details Picks the least-recently-active non-retiring link, marks it
+         *          retiring_ and removes it from tx_links_ so it takes no new frames.
+         *          The link object stays in rx_links_ until its in-flight writes
+         *          drain to 0, at which point reap_retired_linklayers() disposes it.
+         *          Never retires below max_connections (the base must always stand).
+         */
+        bool                                                                        retire_linklayer_runtime() noexcept;
+        /** @brief Dispose links that finished retiring (inflight_ == 0). Strand-affine; called from update(). */
+        void                                                                        reap_retired_linklayers() noexcept;
+
+        /**
          * @brief Connect to a remote host and return logical vmux socket.
          */
         bool                                                                        connect_yield(

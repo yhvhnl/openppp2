@@ -566,6 +566,10 @@ namespace vmux {
                     // permanently lost frame cannot stall that connection's delivery.
                     flow_evict_expired(now);
 
+                    // turbo dynamic pool: dispose any carrier link that finished
+                    // retiring (its in-flight writes drained to 0) since last tick.
+                    reap_retired_linklayers();
+
                     // D11 stall watchdog: if the data tx queue stays at/over the
                     // high-water mark for longer than the stall timeout, the send
                     // side is wedged (carrier not draining; new connections starve)
@@ -1349,6 +1353,11 @@ namespace vmux {
             return false;
         }
 
+        // A link being retired (turbo dynamic pool shrink) takes no new frames.
+        if (linklayer->retiring_) {
+            return false;
+        }
+
         const VirtualEthernetTcpipConnectionPtr& connection = linklayer->connection;
         return NULLPTR != connection && connection->IsLinked();
     }
@@ -1860,6 +1869,103 @@ namespace vmux {
 
         linklayer_update(linklayer);
         return true;
+    }
+
+    /**
+     * @brief Begins retiring the least-recently-active carrier link at runtime (C-B4).
+     */
+    bool vmux_net::retire_linklayer_runtime() noexcept {
+        SynchronizationObjectScope __SCOPE__(syncobj_);
+        if (base_.disposed_.load(std::memory_order_acquire) || !base_.established_) {
+            return false;
+        }
+
+        // Never shrink below the base (--tun-mux): the base pool must always stand.
+        // Count links that are not already retiring.
+        size_t live = 0;
+        for (const vmux_linklayer_ptr& l : rx_links_) {
+            if (NULLPTR != l && !l->retiring_) {
+                live++;
+            }
+        }
+
+        if (live <= status_.max_connections) {
+            return false;
+        }
+
+        // Pick the least-recently-active non-retiring link (the weakest contributor
+        // to the competition pool by our recency proxy).
+        vmux_linklayer_ptr victim;
+        uint64_t oldest = 0;
+        for (const vmux_linklayer_ptr& l : rx_links_) {
+            if (NULLPTR == l || l->retiring_) {
+                continue;
+            }
+
+            if (NULLPTR == victim || l->last_active_ <= oldest) {
+                victim = l;
+                oldest = l->last_active_;
+            }
+        }
+
+        if (NULLPTR == victim) {
+            return false;
+        }
+
+        victim->retiring_ = true;
+
+        // Stop sending new frames on the victim: remove it from the free-link list.
+        // (If it is currently busy it is not in tx_links_; its completion sees
+        // retiring_ and will not re-credit it.)
+        for (vmux_linklayer_list::iterator it = tx_links_.begin(); it != tx_links_.end(); ++it) {
+            if (*it == victim) {
+                tx_links_.erase(it);
+                break;
+            }
+        }
+
+        ppp::telemetry::Count("mux.link.retire.begin", 1);
+        ppp::telemetry::Log(Level::kInfo, "mux", "link retiring (runtime shrink), inflight=%d", (int)victim->inflight_);
+
+        // If it already has no in-flight writes, reap immediately.
+        reap_retired_linklayers();
+        return true;
+    }
+
+    /**
+     * @brief Disposes carrier links that finished retiring (inflight_ == 0).
+     */
+    void vmux_net::reap_retired_linklayers() noexcept {
+        for (vmux_linklayer_vector::iterator it = rx_links_.begin(); it != rx_links_.end();) {
+            vmux_linklayer_ptr linklayer = *it;
+            if (NULLPTR != linklayer && linklayer->retiring_ && linklayer->inflight_ <= 0) {
+                it = rx_links_.erase(it);
+
+                // Ensure it is not left in the free-link list, then dispose its transport.
+                for (vmux_linklayer_list::iterator t = tx_links_.begin(); t != tx_links_.end();) {
+                    if (*t == linklayer) {
+                        t = tx_links_.erase(t);
+                    }
+                    else {
+                        ++t;
+                    }
+                }
+
+                if (NULLPTR != linklayer->connection) {
+                    linklayer->connection->Dispose();
+                }
+
+                if (auto server = std::move(linklayer->server); NULLPTR != server) {
+                    server->Dispose();
+                }
+
+                ppp::telemetry::Count("mux.link.retire.done", 1);
+                ppp::telemetry::Log(Level::kInfo, "mux", "link retired (runtime shrink), links=%d", (int)rx_links_.size());
+            }
+            else {
+                ++it;
+            }
+        }
     }
 
     /**
