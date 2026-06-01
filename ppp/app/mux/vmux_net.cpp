@@ -1784,6 +1784,85 @@ namespace vmux {
     }
 
     /**
+     * @brief Adds one carrier link to an established session at runtime (C-B3).
+     * @details Single-link counterpart of add_linklayer's batch path. Adds exactly
+     *          one link and spawns exactly one forwarding coroutine — never iterates
+     *          rx_links_ (which would re-spawn forwarding on existing links =
+     *          double-forwarding). Strand-affine; respects pool_hard_max. The
+     *          handshake for a runtime link is already completed by the caller
+     *          (ConnectMux), so this only attaches and starts forwarding.
+     */
+    bool vmux_net::add_linklayer_runtime(const VirtualEthernetTcpipConnectionPtr& connection, vmux_linklayer_ptr& linklayer) noexcept {
+        if (NULLPTR == connection) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetAddLinklayerNullConnection);
+            return false;
+        }
+
+        SynchronizationObjectScope __SCOPE__(syncobj_);
+        if (base_.disposed_.load(std::memory_order_acquire)) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionDisposed);
+            return false;
+        }
+
+        // Runtime grow only applies to an already-established session.
+        if (!base_.established_) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetConnectRequireNotEstablished);
+            return false;
+        }
+
+        if (!connection->IsLinked()) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
+            return false;
+        }
+
+        if (rx_links_.size() >= status_.pool_hard_max) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionQuotaExceeded);
+            return false;
+        }
+
+        linklayer = ppp::make_shared_object<vmux_linklayer>();
+        if (NULLPTR == linklayer) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::VmuxNetAddLinklayerAllocFailed);
+            return false;
+        }
+
+        linklayer->connection = connection;
+        tx_links_.emplace_back(linklayer);
+        rx_links_.emplace_back(linklayer);
+
+        ppp::telemetry::Log(Level::kInfo, "mux", "link open (runtime)");
+        ppp::telemetry::Count("mux.link.open.runtime", 1);
+        ppp::telemetry::Log(Level::kDebug, "mux", "link count=%d (runtime grow)", static_cast<int>(rx_links_.size()));
+
+        std::shared_ptr<vmux_net> self = shared_from_this();
+        vmux_linklayer_ptr added = linklayer;
+
+        ContextPtr connection_context = connection->GetContext();
+        StrandPtr connection_strand = connection->GetStrand();
+
+        // Spawn exactly ONE forwarding coroutine for the new link. A runtime link's
+        // handshake is already done (caller ConnectMux'd it), so go straight to
+        // forwarding. On exit, only tear the whole session down if this link was NOT
+        // being retired — a retiring link ending is the normal removal path.
+        auto process =
+            [self, this, added, connection_context, connection_strand](ppp::coroutines::YieldContext& y) noexcept {
+                forwarding(added, y);
+
+                if (!added->retiring_) {
+                    close_exec();
+                }
+            };
+
+        if (!ppp::coroutines::YieldContext::Spawn(BufferAllocator.get(), *connection_context, connection_strand.get(), process)) {
+            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::RuntimeCoroutineSpawnFailed);
+            return false;
+        }
+
+        linklayer_update(linklayer);
+        return true;
+    }
+
+    /**
      * @brief Performs server/client handshake for one attached linklayer.
      */
     bool vmux_net::handshake(const vmux_linklayer_ptr& linklayer, uint16_t connection_id, ppp::coroutines::YieldContext& y) noexcept {
