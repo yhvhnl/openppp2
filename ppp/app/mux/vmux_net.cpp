@@ -1235,12 +1235,26 @@ namespace vmux {
             vmux_linklayer_list::iterator linklayer_endl = tx_links_.end();
 
             if (linklayer_tail != linklayer_endl) {
-                tx_queue_.emplace_back(tx_packet{ packet, packet_length });
-                if (NULLPTR != posted_ac) {
-                    vmux_post_exec(context_, strand_,
-                        [posted_ac]() noexcept {
-                            posted_ac(true);
-                        });
+                // D11 backpressure: normally the acceleration fast-path fires the
+                // completion immediately so the skt read-pump reads the next chunk
+                // without waiting for the send to finish. That decouples reading
+                // from draining and lets tx_queue_ grow unbounded when the carrier
+                // stalls. Once the data queue reaches the high-water mark, fall back
+                // to attaching the completion to the frame so it fires only when the
+                // frame is actually sent — this re-couples the read-pump to drain
+                // progress and throttles ingestion until the backlog clears.
+                bool throttle = tx_queue_.size() >= (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER;
+                if (throttle) {
+                    tx_queue_.emplace_back(tx_packet{ packet, packet_length, posted_ac });
+                }
+                else {
+                    tx_queue_.emplace_back(tx_packet{ packet, packet_length });
+                    if (NULLPTR != posted_ac) {
+                        vmux_post_exec(context_, strand_,
+                            [posted_ac]() noexcept {
+                                posted_ac(true);
+                            });
+                    }
                 }
 
                 return process_tx_all_packets();
