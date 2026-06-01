@@ -241,6 +241,19 @@ namespace vmux {
         uint16_t                                                                    get_max_connections() noexcept { return status_.max_connections; }
         uint64_t                                                                    get_last()            noexcept { return status_.last_; }
         mux_mode                                                                    get_mode()            noexcept { return mode_; }
+        /** @brief Current absolute carrier-link ceiling (turbo dynamic pool). */
+        uint16_t                                                                    get_pool_hard_max()   noexcept { return status_.pool_hard_max; }
+        /** @brief Raise the carrier-link ceiling for turbo before establishment.
+         *  @param hard_max New ceiling; clamped to be >= max_connections. No-op after
+         *         establishment (the base/ceiling are fixed once links are built). */
+        void                                                                        set_pool_hard_max(uint16_t hard_max) noexcept;
+        /**
+         * @brief Consume the turbo controller's pending "add N carrier links" request.
+         * @return Number of links the exchanger should connect+ConnectMux+add now
+         *         (via add_linklayer_runtime). Resets the pending counter to 0.
+         * @note Strand-affine; called by the client exchanger's periodic mux pump.
+         */
+        int                                                                         take_turbo_pending_grow() noexcept;
         static mux_mode                                                             parse_mode(const ppp::string& mode) noexcept;
         /** @brief Map a wire mode byte to a valid scheduler mode (unknown -> compat). */
         static mux_mode                                                             parse_mode_byte(Byte mode_value) noexcept;
@@ -344,6 +357,17 @@ namespace vmux {
         bool                                                                        retire_linklayer_runtime() noexcept;
         /** @brief Dispose links that finished retiring (inflight_ == 0). Strand-affine; called from update(). */
         void                                                                        reap_retired_linklayers() noexcept;
+        /**
+         * @brief Turbo pool controller step (C-B5). Strand-affine; called from update().
+         * @param now Current tick.
+         * @details Derives a target pool size from link quality (a recency/backlog
+         *          proxy — worse quality => larger pool, per the design) within
+         *          [max_connections, pool_hard_max], then moves the live pool one
+         *          step toward it (grow via turbo_pending_grow_ for the exchanger to
+         *          act on; shrink via retire_linklayer_runtime), rate-limited by a
+         *          cooldown for hysteresis. No-op unless turbo is on.
+         */
+        void                                                                        turbo_controller_tick(uint64_t now) noexcept;
 
         /**
          * @brief Connect to a remote host and return logical vmux socket.
@@ -602,6 +626,8 @@ namespace vmux {
         size_t                                                                      tx_queue_high_water_    = (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER; ///< Data tx-queue high-water depth (from config; D11 backpressure).
         uint64_t                                                                    tx_backlog_stall_ms_    = (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT; ///< Backlog stall timeout in ms (from config; D11 watchdog).
         bool                                                                        turbo_                  = false; ///< flow-mode turbo enabled (from config; best-link-first first packet).
+        uint64_t                                                                    turbo_last_adjust_      = 0;     ///< Tick of the last turbo pool grow/shrink step (cooldown base).
+        int                                                                         turbo_pending_grow_     = 0;     ///< Carrier links the turbo controller wants the exchanger to add (consumed by client DoMuxEvents). Strand-affine.
 
         vmux_linklayer_vector                                                       rx_links_;          ///< All link-layer endpoints available for inbound.
         vmux_linklayer_list                                                         tx_links_;          ///< Link-layer endpoints ordered by transmit usage.

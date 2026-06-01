@@ -138,6 +138,34 @@ namespace vmux {
     }
 
     /**
+     * @brief Raises the carrier-link ceiling for turbo before establishment.
+     */
+    void vmux_net::set_pool_hard_max(uint16_t hard_max) noexcept {
+        if (base_.established_) {
+            return; // base/ceiling are fixed once the initial links are built.
+        }
+
+        if (hard_max < status_.max_connections) {
+            hard_max = status_.max_connections;
+        }
+
+        status_.pool_hard_max = hard_max;
+        // pool_current stays at the base until the controller moves it.
+        if (status_.pool_current < status_.max_connections) {
+            status_.pool_current = status_.max_connections;
+        }
+    }
+
+    /**
+     * @brief Consumes the turbo controller's pending grow request.
+     */
+    int vmux_net::take_turbo_pending_grow() noexcept {
+        int n = turbo_pending_grow_;
+        turbo_pending_grow_ = 0;
+        return n;
+    }
+
+    /**
      * @brief Debug-only wire payload for cmd_mux_mode_set.
      *
      * Layout: [mode:1][key_len:1][key:key_len]. The key authorizes the change;
@@ -569,6 +597,10 @@ namespace vmux {
                     // turbo dynamic pool: dispose any carrier link that finished
                     // retiring (its in-flight writes drained to 0) since last tick.
                     reap_retired_linklayers();
+
+                    // turbo dynamic pool controller: move the pool one step toward
+                    // the quality-derived target (grow request / shrink retire).
+                    turbo_controller_tick(now);
 
                     // D11 stall watchdog: if the data tx queue stays at/over the
                     // high-water mark for longer than the stall timeout, the send
@@ -1964,6 +1996,87 @@ namespace vmux {
             }
             else {
                 ++it;
+            }
+        }
+    }
+
+    /**
+     * @brief Turbo pool controller step (C-B5): derive a quality target and move
+     *        the live pool one step toward it, rate-limited by a cooldown.
+     */
+    void vmux_net::turbo_controller_tick(uint64_t now) noexcept {
+        if (!turbo_ || base_.disposed_.load(std::memory_order_acquire) || !base_.established_) {
+            return;
+        }
+
+        uint16_t base = status_.max_connections;
+        uint16_t hard_max = status_.pool_hard_max;
+        if (hard_max <= base) {
+            return; // no headroom (turbo factor 1 or misconfigured): nothing to do.
+        }
+
+        // Cooldown / hysteresis: at most one grow or shrink step per cooldown window.
+        if (turbo_last_adjust_ != 0 && (now - turbo_last_adjust_) < (uint64_t)PPP_MUX_TURBO_CONTROL_COOLDOWN) {
+            return;
+        }
+
+        // Quality proxy (worse quality => larger pool, per design): use the data
+        // backlog relative to the high-water mark. Empty queue => quality good =>
+        // factor 1 (target = base). At/above high-water => quality bad => factor
+        // up to PPP_MUX_TURBO_FACTOR_MAX (target = base * max). This reuses an
+        // existing signal (tx_queue_ depth) with no new measurement.
+        size_t depth = tx_queue_.size();
+        size_t hw = (tx_queue_high_water_ > 0) ? tx_queue_high_water_ : (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER;
+
+        int factor = 1;
+        if (depth >= hw) {
+            factor = PPP_MUX_TURBO_FACTOR_MAX;
+        }
+        else if (depth > 0) {
+            // Linear interpolation of the factor in (1 .. FACTOR_MAX) by backlog ratio.
+            int span = PPP_MUX_TURBO_FACTOR_MAX - 1;
+            factor = 1 + (int)((depth * (size_t)span) / hw);
+            if (factor < 1) {
+                factor = 1;
+            }
+            else if (factor > PPP_MUX_TURBO_FACTOR_MAX) {
+                factor = PPP_MUX_TURBO_FACTOR_MAX;
+            }
+        }
+
+        uint32_t target = (uint32_t)base * (uint32_t)factor;
+        if (target < base) {
+            target = base;
+        }
+        else if (target > hard_max) {
+            target = hard_max;
+        }
+
+        // Count live (non-retiring) links and any pending grow already requested.
+        size_t live = 0;
+        for (const vmux_linklayer_ptr& l : rx_links_) {
+            if (NULLPTR != l && !l->retiring_) {
+                live++;
+            }
+        }
+
+        size_t effective = live + (size_t)(turbo_pending_grow_ > 0 ? turbo_pending_grow_ : 0);
+
+        if (effective < (size_t)target) {
+            // Grow one step: ask the exchanger to add a link (it owns connect()).
+            turbo_pending_grow_++;
+            turbo_last_adjust_ = now;
+            status_.pool_current = (uint16_t)std::min<uint32_t>(effective + 1, hard_max);
+            ppp::telemetry::Gauge("mux.turbo.pool.target", (int64_t)target);
+            ppp::telemetry::Count("mux.turbo.pool.grow", 1);
+        }
+        elif((size_t)target < live) {
+            // Shrink one step: retire the weakest link locally.
+            if (retire_linklayer_runtime()) {
+                turbo_last_adjust_ = now;
+                status_.pool_current = (uint16_t)(live - 1);
+                ppp::telemetry::Gauge("mux.turbo.pool.target", (int64_t)target);
+                ppp::telemetry::Count("mux.turbo.pool.shrink", 1);
             }
         }
     }

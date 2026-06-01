@@ -356,6 +356,8 @@ static constexpr int                                                        PPP_
 static constexpr int                                                        PPP_MUX_FLOW_REORDER_TIMEOUT    = 400;      /* gap wait timeout in ms (flow v2); near link RTT to bound stuck->self-heal */
 static constexpr int                                                        PPP_MUX_TX_QUEUE_HIGH_WATER     = 4096;     /* data tx_queue_ depth at which the acceleration read-pump is throttled (D11 backpressure) */
 static constexpr int                                                        PPP_MUX_TX_BACKLOG_STALL_TIMEOUT = 8000;    /* ms the data tx queue may stay backlogged before the session is rebuilt (D11 watchdog) */
+static constexpr int                                                        PPP_MUX_TURBO_FACTOR_MAX        = 3;        /* turbo dynamic pool: max multiplier of the --tun-mux base (pool_hard_max = base * this) */
+static constexpr int                                                        PPP_MUX_TURBO_CONTROL_COOLDOWN  = 3000;     /* ms minimum interval between turbo pool grow/shrink steps (hysteresis vs jitter) */
 static constexpr int                                                        PPP_UDP_INACTIVE_TIMEOUT        = 72;
 static constexpr int                                                        PPP_UDP_KEEP_ALIVED_MIN_TIMEOUT = 20;
 static constexpr int                                                        PPP_UDP_KEEP_ALIVED_MAX_TIMEOUT = 60;
