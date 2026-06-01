@@ -25,6 +25,8 @@
 #include <ppp/diagnostics/Telemetry.h>
 #include <ppp/threading/Executors.h>
 
+#include <cstdlib>
+
 #if defined(_WIN32)
 #   include <conio.h>
 #   include <io.h>
@@ -37,62 +39,53 @@
 
 namespace ppp::app {
 
-namespace {
-    static bool HandleTelemetryHotkey(char ch) noexcept {
-        auto emit_state = []() noexcept {
-            ppp::string msg = "Telemetry filter: ";
-            msg += ppp::telemetry::IsConsoleLogEnabled() ? "log=on " : "log=off ";
-            msg += ppp::telemetry::IsConsoleMetricEnabled() ? "metric=on " : "metric=off ";
-            msg += ppp::telemetry::IsConsoleSpanEnabled() ? "span=on " : "span=off ";
-            msg += "level=" + std::to_string(ppp::telemetry::GetMinLevel());
-            ConsoleUI::GetInstance().AppendLine(msg);
-        };
+// ---------------------------------------------------------------------------
+// TUI-aware telemetry sink — redirects telemetry stderr output into the
+// ConsoleUI event ring buffer when the TUI is active.
+// ---------------------------------------------------------------------------
 
-        switch (ch) {
-            case 'l':
-            case 'L':
-                ppp::telemetry::SetConsoleLogEnabled(!ppp::telemetry::IsConsoleLogEnabled());
-                emit_state();
-                return true;
-            case 'm':
-            case 'M':
-                ppp::telemetry::SetConsoleMetricEnabled(!ppp::telemetry::IsConsoleMetricEnabled());
-                emit_state();
-                return true;
-            case 's':
-            case 'S':
-                ppp::telemetry::SetConsoleSpanEnabled(!ppp::telemetry::IsConsoleSpanEnabled());
-                emit_state();
-                return true;
-            case '0':
-            case '1':
-            case '2':
-            case '3':
-                ppp::telemetry::SetMinLevel(ch - '0');
-                emit_state();
-                return true;
-            case 'a':
-            case 'A':
-                ppp::telemetry::SetConsoleLogEnabled(true);
-                ppp::telemetry::SetConsoleMetricEnabled(true);
-                ppp::telemetry::SetConsoleSpanEnabled(true);
-                emit_state();
-                return true;
-            case 'q':
-            case 'Q':
-                ppp::telemetry::SetConsoleLogEnabled(false);
-                ppp::telemetry::SetConsoleMetricEnabled(false);
-                ppp::telemetry::SetConsoleSpanEnabled(false);
-                emit_state();
-                return true;
-            case '?':
-                ConsoleUI::GetInstance().AppendLine("Telemetry hotkeys: l=toggle log, m=toggle metric, s=toggle span, 0/1/2/3=set level, a=all, q=quiet, ?=help");
-                emit_state();
-                return true;
-            default:
-                return false;
+/**
+ * @brief Console sink callback installed into the telemetry backend.
+ *
+ * Called from the TelemetryBackend worker thread for every formatted
+ * telemetry line that would otherwise be written to stderr.
+ */
+static void TelemetryToConsoleUI(const char* line) noexcept {
+    // The telemetry backend loads the sink function pointer without taking the
+    // ConsoleUI lifecycle lock.  Stop() clears running_ before unregistering the
+    // sink, so this guard closes the small race where a backend worker may have
+    // already loaded this callback while the TUI is tearing down.
+    if (!ConsoleUI::IsRunning()) {
+        return;
+    }
+
+    ConsoleUI::GetInstance().AppendTelemetryEventLine(line);
+}
+
+/**
+ * @brief Strips ANSI escape sequences from a string.
+ *
+ * Removes all occurrences of ESC[...m (SGR) sequences so that the
+ * resulting string contains only printable characters suitable for
+ * FitWidth() display-width calculation.
+ */
+static ppp::string StripAnsiEscapes(const ppp::string& s) noexcept {
+    ppp::string result;
+    result.reserve(s.size());
+    bool in_escape = false;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (in_escape) {
+            if (('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')) {
+                in_escape = false;
+            }
+        } else if (c == '\x1b') {
+            in_escape = true;
+        } else {
+            result.push_back(c);
         }
     }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +112,48 @@ static constexpr const char kBT[]   = "\xe2\x94\xb4";
 static constexpr const char kHH[]   = "\xe2\x94\x80";
 /** @brief Vertical line:     │ (U+2502) */
 static constexpr const char kVV[]   = "\xe2\x94\x82";
+
+static bool g_use_unicode_ui_glyphs = true;
+
+static bool IsEnvEnabled(const char* name) noexcept {
+    const char* value = std::getenv(name);
+    if (NULLPTR == value || '\0' == value[0]) {
+        return false;
+    }
+
+    char first = value[0];
+    return first != '0' && first != 'n' && first != 'N' && first != 'f' && first != 'F';
+}
+
+static bool SelectUnicodeUiGlyphs() noexcept {
+    if (IsEnvEnabled("PPP_TUI_ASCII")) {
+        return false;
+    }
+    if (IsEnvEnabled("PPP_TUI_UTF8")) {
+        return true;
+    }
+
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
+}
+
+static bool UseUnicodeUiGlyphs() noexcept {
+    return g_use_unicode_ui_glyphs;
+}
+
+static const char* BoxBL() noexcept { return UseUnicodeUiGlyphs() ? kBL  : "+"; }
+static const char* BoxBR() noexcept { return UseUnicodeUiGlyphs() ? kBR  : "+"; }
+static const char* BoxBBL() noexcept { return UseUnicodeUiGlyphs() ? kBBL : "+"; }
+static const char* BoxBBR() noexcept { return UseUnicodeUiGlyphs() ? kBBR : "+"; }
+static const char* BoxLT() noexcept { return UseUnicodeUiGlyphs() ? kLT  : "+"; }
+static const char* BoxRT() noexcept { return UseUnicodeUiGlyphs() ? kRT  : "+"; }
+static const char* BoxTT() noexcept { return UseUnicodeUiGlyphs() ? kTT  : "+"; }
+static const char* BoxBT() noexcept { return UseUnicodeUiGlyphs() ? kBT  : "+"; }
+static const char* BoxHH() noexcept { return UseUnicodeUiGlyphs() ? kHH  : "-"; }
+static const char* BoxVV() noexcept { return UseUnicodeUiGlyphs() ? kVV  : "|"; }
 
 // ---------------------------------------------------------------------------
 // ANSI escape sequences
@@ -194,7 +229,7 @@ ppp::string ConsoleUI::RepeatHoriz(int count) noexcept {
     ppp::string s;
     s.reserve(static_cast<std::size_t>(count) * 3u);
     for (int i = 0; i < count; ++i) {
-        s += kHH;
+        s += BoxHH();
     }
     return s;
 }
@@ -228,10 +263,10 @@ ppp::string ConsoleUI::BoxContentRow(const ppp::string& content, int width) noex
     // never appears flush against the │ wall.
     ppp::string row;
     row.reserve(3u + static_cast<std::size_t>(inner) + 3u + 1u);
-    row += kVV;
+    row += BoxVV();
     row += FitWidth(content, inner - 1);
     row += " ";
-    row += kVV;
+    row += BoxVV();
     row += "\n";
     return row;
 }
@@ -257,11 +292,11 @@ ppp::string ConsoleUI::BoxSplitRow(
     row.reserve(3u + static_cast<std::size_t>(left_inner)
               + 3u + static_cast<std::size_t>(right_inner)
               + 3u + 1u);
-    row += kVV;
+    row += BoxVV();
     row += FitWidth(left, left_inner);
-    row += kVV;
+    row += BoxVV();
     row += FitWidth(right, right_inner);
-    row += kVV;
+    row += BoxVV();
     row += "\n";
     return row;
 }
@@ -273,9 +308,9 @@ ppp::string ConsoleUI::BoxSepRow(int width) noexcept {
 
     ppp::string row;
     row.reserve(3u + static_cast<std::size_t>(width - 2) * 3u + 3u + 1u);
-    row += kLT;
+    row += BoxLT();
     row += RepeatHoriz(width - 2);
-    row += kRT;
+    row += BoxRT();
     row += "\n";
     return row;
 }
@@ -289,11 +324,11 @@ ppp::string ConsoleUI::BoxSplitSepRow(int width, int split) noexcept {
     row.reserve(3u + static_cast<std::size_t>(split - 1) * 3u
               + 3u + static_cast<std::size_t>(width - split - 2) * 3u
               + 3u + 1u);
-    row += kLT;
+    row += BoxLT();
     row += RepeatHoriz(split - 1);
-    row += kTT;
+    row += BoxTT();
     row += RepeatHoriz(width - split - 2);
-    row += kRT;
+    row += BoxRT();
     row += "\n";
     return row;
 }
@@ -305,9 +340,9 @@ ppp::string ConsoleUI::BoxBotRow(int width) noexcept {
 
     ppp::string row;
     row.reserve(3u + static_cast<std::size_t>(width - 2) * 3u + 3u + 1u);
-    row += kBBL;
+    row += BoxBBL();
     row += RepeatHoriz(width - 2);
-    row += kBBR;
+    row += BoxBBR();
     row += "\n";
     return row;
 }
@@ -321,11 +356,11 @@ ppp::string ConsoleUI::BoxBotSplitRow(int width, int split) noexcept {
     row.reserve(3u + static_cast<std::size_t>(split - 1) * 3u
               + 3u + static_cast<std::size_t>(width - split - 2) * 3u
               + 3u + 1u);
-    row += kBBL;
+    row += BoxBBL();
     row += RepeatHoriz(split - 1);
-    row += kBT;
+    row += BoxBT();
     row += RepeatHoriz(width - split - 2);
-    row += kBBR;
+    row += BoxBBR();
     row += "\n";
     return row;
 }
@@ -349,7 +384,7 @@ ppp::string ConsoleUI::RenderArtLine(
 
     ppp::string row;
     row.reserve(3u + static_cast<std::size_t>(inner_width + 1) * 8u);
-    row += kVV;  // left border
+    row += BoxVV();  // left border
 
     // Left padding
     if (0 < padding) {
@@ -402,7 +437,7 @@ ppp::string ConsoleUI::RenderArtLine(
         }
     }
 
-    row += kVV;  // right border
+    row += BoxVV();  // right border
     row += "\n";
     return row;
 }
@@ -550,6 +585,10 @@ ppp::string ConsoleUI::FormatAge(uint64_t now_ms, uint64_t then_ms) noexcept {
 // ---------------------------------------------------------------------------
 
 bool ConsoleUI::ShouldEnable() noexcept {
+    if (IsEnvEnabled("PPP_NO_TUI")) {
+        return false;
+    }
+
 #if defined(_WIN32)
     return 0 != ::_isatty(::_fileno(stdout));
 #else
@@ -567,13 +606,7 @@ bool ConsoleUI::Start() noexcept {
         return true;  // already running
     }
 
-    vt_enabled_ = EnableVirtualTerminal();
-
-    if (!PrepareInputTerminal()) {
-        ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::RuntimeOptionalUiStartFailed);
-        running_.store(false, std::memory_order_release);
-        return false;
-    }
+    g_use_unicode_ui_glyphs = SelectUnicodeUiGlyphs();
 
     // -----------------------------------------------------------------------
     // Save the current console state so Stop() can restore it verbatim.
@@ -584,6 +617,12 @@ bool ConsoleUI::Start() noexcept {
     win_stdout_handle_  = ::GetStdHandle(STD_OUTPUT_HANDLE);
     win_out_mode_saved_ = false;
     win_cursor_saved_   = false;
+    win_output_cp_saved_ = false;
+
+    // Save the current console output code page before EnableVirtualTerminal()
+    // may switch it to UTF-8 when Unicode UI glyphs are explicitly enabled.
+    win_original_output_cp_ = ::GetConsoleOutputCP();
+    win_output_cp_saved_    = true;
 
     if (NULLPTR != win_stdout_handle_ && INVALID_HANDLE_VALUE != win_stdout_handle_) {
         DWORD mode = 0;
@@ -600,6 +639,34 @@ bool ConsoleUI::Start() noexcept {
     }
 #endif
 
+    vt_enabled_ = EnableVirtualTerminal();
+
+    if (!PrepareInputTerminal()) {
+        ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::RuntimeOptionalUiStartFailed);
+        running_.store(false, std::memory_order_release);
+#if defined(_WIN32)
+        if (NULLPTR != win_stdout_handle_ && INVALID_HANDLE_VALUE != win_stdout_handle_) {
+            if (win_out_mode_saved_) {
+                ::SetConsoleMode(static_cast<HANDLE>(win_stdout_handle_), win_original_out_mode_);
+            }
+            if (win_cursor_saved_) {
+                CONSOLE_CURSOR_INFO cci{};
+                cci.dwSize   = 25;
+                cci.bVisible = win_cursor_visible_ ? TRUE : FALSE;
+                ::SetConsoleCursorInfo(static_cast<HANDLE>(win_stdout_handle_), &cci);
+            }
+        }
+        if (win_output_cp_saved_) {
+            ::SetConsoleOutputCP(win_original_output_cp_);
+        }
+        win_stdout_handle_   = NULLPTR;
+        win_out_mode_saved_  = false;
+        win_cursor_saved_    = false;
+        win_output_cp_saved_ = false;
+#endif
+        return false;
+    }
+
     // Enter alternate screen buffer + permanently hide the real cursor.
     // The synthetic reverse-video cursor block inside the editor line is the
     // only indicator of input position, eliminating all cursor flicker.
@@ -612,6 +679,14 @@ bool ConsoleUI::Start() noexcept {
             ppp::HideConsoleCursor(false);
             self.LeaveAlternateScreen();
         }
+#if defined(_WIN32)
+        // Restore the console output code page on abnormal exit so that
+        // the user's shell is not left in UTF-8 mode if the process is
+        // killed without going through Stop().
+        if (self.win_output_cp_saved_) {
+            ::SetConsoleOutputCP(self.win_original_output_cp_);
+        }
+#endif
     });
 
     force_redraw_.store(true, std::memory_order_release);
@@ -636,6 +711,11 @@ bool ConsoleUI::Start() noexcept {
     }
 
     AppendLine("Console UI started. Type 'openppp2 help' for commands.");
+
+    // Redirect telemetry console output into the TUI event buffer instead
+    // of stderr.  The file sink is unaffected.
+    ppp::telemetry::SetConsoleSink(&TelemetryToConsoleUI);
+
     return true;
 }
 
@@ -643,6 +723,11 @@ void ConsoleUI::Stop() noexcept {
     if (!running_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+
+    // Unregister the telemetry console sink so that the backend reverts to
+    // stderr output after the TUI tears down.  Must happen before the render
+    // thread joins, to avoid a use-after-teardown race.
+    ppp::telemetry::SetConsoleSink(nullptr);
 
     // Wake the render thread so it exits its condition-variable wait immediately
     // rather than blocking up to the full 100 ms timeout.
@@ -682,9 +767,14 @@ void ConsoleUI::Stop() noexcept {
             ::SetConsoleCursorInfo(static_cast<HANDLE>(win_stdout_handle_), &cci);
         }
     }
+    // Restore the original console output code page when Start() saved it.
+    if (win_output_cp_saved_) {
+        ::SetConsoleOutputCP(win_original_output_cp_);
+    }
     win_stdout_handle_  = NULLPTR;
     win_out_mode_saved_ = false;
     win_cursor_saved_   = false;
+    win_output_cp_saved_ = false;
 #endif
 }
 
@@ -782,6 +872,61 @@ void ConsoleUI::SetTelemetryLines(const ppp::vector<ppp::string>& lines) noexcep
     MarkDirty();
 }
 
+bool ConsoleUI::IsRunning() noexcept {
+    return GetInstance().running_.load(std::memory_order_acquire);
+}
+
+void ConsoleUI::AppendTelemetryEventLine(const char* line) noexcept {
+    if (!line || '\0' == line[0]) {
+        return;
+    }
+
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    ppp::string clean = StripAnsiEscapes(ppp::string(line));
+
+    // Strip trailing newline / carriage-return
+    while (!clean.empty() && ('\n' == clean.back() || '\r' == clean.back())) {
+        clean.pop_back();
+    }
+    if (clean.empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> scope(lock_);
+        telemetry_event_lines_.push_back(std::move(clean));
+        while (kMaxTelemetryEventLines < static_cast<int>(telemetry_event_lines_.size())) {
+            telemetry_event_lines_.pop_front();
+        }
+    }
+    // Telemetry can be high-volume.  Always set dirty_ so the render loop will
+    // repaint on its regular 100 ms cadence, but throttle CV notifications to
+    // avoid one wakeup/futex per event during bursts.
+    dirty_.store(true, std::memory_order_release);
+    uint64_t now_ms = ppp::GetTickCount();
+    uint64_t last_ms = last_telemetry_dirty_notify_ms_.load(std::memory_order_acquire);
+    if (now_ms < last_ms || now_ms - last_ms >= kTelemetryDirtyNotifyIntervalMs) {
+        if (last_telemetry_dirty_notify_ms_.compare_exchange_strong(
+                last_ms,
+                now_ms,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            render_cv_.notify_one();
+        }
+    }
+}
+
+void ConsoleUI::ClearTelemetryEventLines() noexcept {
+    {
+        std::lock_guard<std::mutex> scope(lock_);
+        telemetry_event_lines_.clear();
+    }
+    MarkDirty();
+}
+
 // ---------------------------------------------------------------------------
 // Internal: drain status queue
 // ---------------------------------------------------------------------------
@@ -845,7 +990,7 @@ void ConsoleUI::DrainStatusQueue() noexcept {
             ppp::string rx_val = (ppp::string::npos == end_pos)
                 ? txt.substr(rx_pos + 3u)
                 : txt.substr(rx_pos + 3u, end_pos - rx_pos - 3u);
-            last_speed += "\xe2\x86\x93 ";
+            last_speed += UseUnicodeUiGlyphs() ? "\xe2\x86\x93 " : "rx ";
             last_speed += rx_val;
         }
 
@@ -861,7 +1006,7 @@ void ConsoleUI::DrainStatusQueue() noexcept {
                 last_speed += "  ";
             }
 
-            last_speed += "\xe2\x86\x91 ";
+            last_speed += UseUnicodeUiGlyphs() ? "\xe2\x86\x91 " : "tx ";
             last_speed += tx_val;
         }
     }
@@ -982,6 +1127,7 @@ void ConsoleUI::RenderFrame() noexcept {
     // -----------------------------------------------------------------------
     ppp::vector<ppp::string> info_snap;
     ppp::vector<ppp::string> telemetry_snap;
+    std::deque<ppp::string>  tele_event_snap;
     int                      info_scroll;
     std::deque<ppp::string>  cmd_snap;
     int                      cmd_scroll;
@@ -990,22 +1136,24 @@ void ConsoleUI::RenderFrame() noexcept {
 
     {
         std::lock_guard<std::mutex> scope(lock_);
-        info_snap      = info_lines_;
-        telemetry_snap = telemetry_lines_;
-        info_scroll    = info_scroll_;
-        cmd_snap       = cmd_lines_;
-        cmd_scroll     = cmd_scroll_;
-        input_snap     = input_buffer_;
-        cursor_snap    = input_cursor_;
+        info_snap       = info_lines_;
+        telemetry_snap  = telemetry_lines_;
+        tele_event_snap = telemetry_event_lines_;
+        info_scroll     = info_scroll_;
+        cmd_snap        = cmd_lines_;
+        cmd_scroll      = cmd_scroll_;
+        input_snap      = input_buffer_;
+        cursor_snap     = input_cursor_;
     }
 
     // -----------------------------------------------------------------------
     // 2c. Dynamic split: allocate middle rows between info and cmd based
     //     on their actual content sizes, avoiding one panel starving the other.
     // -----------------------------------------------------------------------
-    int info_total  = static_cast<int>(info_snap.size());
-    int tele_total  = static_cast<int>(telemetry_snap.size());
-    int cmd_total   = static_cast<int>(cmd_snap.size());
+    int info_total      = static_cast<int>(info_snap.size());
+    int tele_total      = static_cast<int>(telemetry_snap.size());
+    int tele_event_total = static_cast<int>(tele_event_snap.size());
+    int cmd_total       = static_cast<int>(cmd_snap.size());
 
     int info_h, cmd_h;
 
@@ -1081,10 +1229,11 @@ void ConsoleUI::RenderFrame() noexcept {
     {
         int total       = static_cast<int>(info_snap.size());
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = ((width - 2) >= kTwoColMinInner) && (tele_total > 0);
+        const bool two_col = ((width - 2) >= kTwoColMinInner)
+                          && (tele_total > 0 || tele_event_total > 0);
         // In two-column mode only the left column scrolls; right column is static.
-        // In single-column mode info + telemetry are combined and scroll together.
-        int combined    = two_col ? total : (total + tele_total);
+        // In single-column mode info + telemetry status + events are combined.
+        int combined    = two_col ? total : (total + tele_total + tele_event_total);
         int max_scroll  = std::max(0, combined - info_h);
         if (info_scroll > max_scroll) {
             info_scroll = max_scroll;
@@ -1133,28 +1282,30 @@ void ConsoleUI::RenderFrame() noexcept {
 
     // --- Row 0: top border ┌─────┐ ---
     {
-        frame += kBL;
+        frame += BoxBL();
         frame += RepeatHoriz(width - 2);
-        frame += kBR;
+        frame += BoxBR();
         frame += "\n";
     }
 
     // --- Row 1: hint 1 + right-aligned title ---
     {
         static constexpr const char kLeftHint1[]   = " PageUp/PageDown: Scroll command input/output";
-        static constexpr const char kRightTitle[]  = "PPP PRIVATE NETWORK\xe2\x84\xa2 2 ";
-        // kRightTitle display width: P-P-P- -P-R-I-V-A-T-E- -N-E-T-W-O-R-K-TM- -2-space = 23 cols
-        static constexpr int kRightTitleDisplayW   = 23;
+        const bool unicode_ui = UseUnicodeUiGlyphs();
+        const char* kRightTitle = unicode_ui
+            ? "PPP PRIVATE NETWORK\xe2\x84\xa2 2 "
+            : "PPP PRIVATE NETWORK(TM) 2 ";
+        const int kRightTitleDisplayW = unicode_ui ? 23 : 26;
 
         int left_avail  = inner - kRightTitleDisplayW;
         if (0 > left_avail) {
             left_avail = 0;
         }
 
-        frame += kVV;
+        frame += BoxVV();
         frame += FitWidth(kLeftHint1, left_avail);
         frame += kRightTitle;
-        frame += kVV;
+        frame += BoxVV();
         frame += "\n";
     }
 
@@ -1180,9 +1331,10 @@ void ConsoleUI::RenderFrame() noexcept {
     frame += BoxSepRow(width);
 
     // --- Info section (info_h rows) ---
-    // Two-column mode when inner width >= 96 display columns.
-    // Left column shows lines [0..mid), right column shows [mid..end).
-    // This doubles the visible info capacity on wide terminals.
+    // Two-column mode when inner width >= 76 display columns and there is
+    // any telemetry content (status snapshot or event stream).
+    // Left column shows environment info, right column shows telemetry
+    // status lines at the top with recent event lines filling the rest.
     {
         int total  = static_cast<int>(info_snap.size());
         int start  = info_scroll;  // 0 = top of info content
@@ -1190,44 +1342,63 @@ void ConsoleUI::RenderFrame() noexcept {
         // Minimum inner width needed for two-column mode:
         // Each column needs at least 40 chars of content + 1 separator + 2 borders.
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = (inner >= kTwoColMinInner) && (tele_total > 0);
+        const bool two_col = (inner >= kTwoColMinInner)
+                          && (tele_total > 0 || tele_event_total > 0);
 
         if (two_col) {
             // Left column: environment info from info_snap.
-            // Right column: telemetry lines from telemetry_snap.
-            // ALL rows use BoxSplitRow so the center │ aligns consistently.
+            // Right column: telemetry status snapshot (top) + recent events (bottom).
             int split_col = inner / 2 + 1;  // display column for center │
-            int tele_start = 0;  // telemetry has its own independent content
+
+            // In the right column, status lines come first, then event lines.
+            // If there are more combined lines than info_h, the most recent
+            // event lines are shown (older ones are truncated from the bottom).
+            int right_total = tele_total + tele_event_total;
+            int right_event_start = 0;  // offset within tele_event_snap to start from
+            if (right_total > info_h) {
+                // More content than rows — trim events from the front.
+                int overflow = right_total - info_h;
+                right_event_start = std::min(overflow, tele_event_total);
+            }
 
             for (int i = 0; i < info_h; ++i) {
                 int left_idx = start + i;
-                int right_idx = tele_start + i;
 
                 ppp::string left_text;
                 if (0 <= left_idx && left_idx < total) {
                     left_text = " " + info_snap[static_cast<std::size_t>(left_idx)];
                 }
 
+                // Build right column line: status first, then events.
                 ppp::string right_text;
-                if (0 <= right_idx && right_idx < tele_total) {
-                    right_text = " " + telemetry_snap[static_cast<std::size_t>(right_idx)];
+                if (i < tele_total) {
+                    right_text = " " + telemetry_snap[static_cast<std::size_t>(i)];
+                } else {
+                    int event_idx = right_event_start + (i - tele_total);
+                    if (event_idx >= 0 && event_idx < tele_event_total) {
+                        right_text = " " + tele_event_snap[static_cast<std::size_t>(event_idx)];
+                    }
                 }
 
                 frame += BoxSplitRow(left_text, right_text, width, split_col);
             }
         } else {
-            // Single column: info lines, then telemetry lines appended.
+            // Single column: info lines, then telemetry status, then event lines.
             for (int i = 0; i < info_h; ++i) {
                 int idx = start + i;
                 if (0 <= idx && idx < total) {
                     frame += BoxContentRow(" " + info_snap[static_cast<std::size_t>(idx)], width);
                 } else {
-                    // After info lines, show telemetry lines.
                     int tele_idx = idx - total;
                     if (tele_idx >= 0 && tele_idx < tele_total) {
                         frame += BoxContentRow(" " + telemetry_snap[static_cast<std::size_t>(tele_idx)], width);
                     } else {
-                        frame += BoxContentRow("", width);
+                        int event_idx = tele_idx - tele_total;
+                        if (event_idx >= 0 && event_idx < tele_event_total) {
+                            frame += BoxContentRow(" " + tele_event_snap[static_cast<std::size_t>(event_idx)], width);
+                        } else {
+                            frame += BoxContentRow("", width);
+                        }
                     }
                 }
             }
@@ -1262,7 +1433,7 @@ void ConsoleUI::RenderFrame() noexcept {
     // --- Input row ---
     int cursor_col = 0;
     {
-        frame += kVV;
+        frame += BoxVV();
 
         if (input_snap.empty()) {
             // Placeholder mode: show the white-block cursor at column 2 (after "> ")
@@ -1297,7 +1468,7 @@ void ConsoleUI::RenderFrame() noexcept {
             frame += editor_content;
         }
 
-        frame += kVV;
+        frame += BoxVV();
         frame += "\n";
     }
 
@@ -1364,7 +1535,7 @@ void ConsoleUI::RenderFrame() noexcept {
             status_text += ppp::telemetry::IsConsoleSpanEnabled() ? "S" : "-";
             status_text += " @";
             status_text += std::to_string(ppp::telemetry::GetMinLevel());
-            status_text += " [?]";
+            status_text += " (openppp2 telemetry help)";
         }
 
         // Build right panel: "VPN: state  ↑ tx  ↓ rx"
@@ -1391,13 +1562,13 @@ void ConsoleUI::RenderFrame() noexcept {
 
             ppp::string row;
             row.reserve(static_cast<std::size_t>(width) * 4u + 64u);
-            row += kVV;
+            row += BoxVV();
             row += status_color;
             row += FitWidth(status_text, left_inner);
             row += kColorReset;
-            row += kVV;
+            row += BoxVV();
             row += FitWidth(right_text, right_inner);
-            row += kVV;
+            row += BoxVV();
             row += "\n";
             frame += row;
         } else {
@@ -1591,11 +1762,12 @@ void ConsoleUI::ScrollInfoBy(int delta) noexcept {
     int inner = w - 2;
     {
         std::lock_guard<std::mutex> scope(lock_);
-        int total = static_cast<int>(info_lines_.size());
-        int tele  = static_cast<int>(telemetry_lines_.size());
+        int total  = static_cast<int>(info_lines_.size());
+        int tele   = static_cast<int>(telemetry_lines_.size());
+        int events = static_cast<int>(telemetry_event_lines_.size());
         static constexpr int kTwoColMinInner = 76;
-        const bool two_col = (inner >= kTwoColMinInner) && (tele > 0);
-        int combined = two_col ? total : (total + tele);
+        const bool two_col = (inner >= kTwoColMinInner) && (tele > 0 || events > 0);
+        int combined = two_col ? total : (total + tele + events);
 
         int next = info_scroll_ + delta;
         if (0 > next) {
@@ -1712,13 +1884,16 @@ void ConsoleUI::ExecuteCommand(const ppp::string& command_line) noexcept {
     if (!openppp2_sub.empty()) {
         if ("help" == openppp2_sub) {
             AppendLine("Available openppp2 commands:");
-            AppendLine("  openppp2 help    - Show this help information");
-            AppendLine("  openppp2 restart - Restart the application");
-            AppendLine("  openppp2 reload  - Reload configuration (restart)");
-            AppendLine("  openppp2 exit    - Exit the application");
-            AppendLine("  openppp2 info    - Print full runtime environment snapshot");
-            AppendLine("  openppp2 clear   - Clear command output section");
-            AppendLine("  <shell command>  - Execute a system shell command");
+            AppendLine("  openppp2 help             - Show this help information");
+            AppendLine("  openppp2 restart          - Restart the application");
+            AppendLine("  openppp2 reload           - Reload configuration (restart)");
+            AppendLine("  openppp2 exit             - Exit the application");
+            AppendLine("  openppp2 info             - Print full runtime environment snapshot");
+            AppendLine("  openppp2 clear            - Clear command output section");
+            AppendLine("  openppp2 telemetry ...    - Telemetry filter controls (status/help/log/metric/span/level/all/quiet/clear)");
+            AppendLine("  <shell command>           - Execute a system shell command");
+            AppendLine("");
+            AppendLine("All typed characters are normal input; no single-key hotkeys.");
             return;
         }
 
@@ -1762,6 +1937,152 @@ void ConsoleUI::ExecuteCommand(const ppp::string& command_line) noexcept {
                     AppendLine(line);
                 }
             }
+            return;
+        }
+
+        // ---- Telemetry sub-namespace ----
+        static constexpr const char kTelNS[] = "telemetry";
+        static constexpr std::size_t kTelNSLen = sizeof(kTelNS) - 1u;
+
+        if (openppp2_sub.size() >= kTelNSLen &&
+            0u == openppp2_sub.compare(0u, kTelNSLen, kTelNS) &&
+            (openppp2_sub.size() == kTelNSLen || ' ' == openppp2_sub[kTelNSLen])) {
+
+            auto emit_state = []() noexcept {
+                ppp::string msg = "Telemetry filter: ";
+                msg += ppp::telemetry::IsConsoleLogEnabled() ? "log=on " : "log=off ";
+                msg += ppp::telemetry::IsConsoleMetricEnabled() ? "metric=on " : "metric=off ";
+                msg += ppp::telemetry::IsConsoleSpanEnabled() ? "span=on " : "span=off ";
+                msg += "level=" + std::to_string(ppp::telemetry::GetMinLevel());
+                ConsoleUI::GetInstance().AppendLine(msg);
+            };
+
+            ppp::string tel_rest;
+            if (openppp2_sub.size() > kTelNSLen) {
+                tel_rest = ppp::LTrim(openppp2_sub.substr(kTelNSLen + 1u));
+            }
+
+            if (tel_rest.empty() || "status" == tel_rest) {
+                emit_state();
+                return;
+            }
+
+            if ("help" == tel_rest) {
+                AppendLine("Telemetry commands:");
+                AppendLine("  openppp2 telemetry                    - Show telemetry status");
+                AppendLine("  openppp2 telemetry status             - Show telemetry status");
+                AppendLine("  openppp2 telemetry help               - Show this help");
+                AppendLine("  openppp2 telemetry log on|off|toggle  - Toggle console log filter");
+                AppendLine("  openppp2 telemetry metric on|off|toggle - Toggle console metric filter");
+                AppendLine("  openppp2 telemetry span on|off|toggle - Toggle console span filter");
+                AppendLine("  openppp2 telemetry level 0|1|2|3      - Set telemetry verbosity threshold");
+                AppendLine("  openppp2 telemetry all                - Enable all telemetry filters");
+                AppendLine("  openppp2 telemetry quiet              - Disable all telemetry filters");
+                AppendLine("  openppp2 telemetry clear              - Clear telemetry event buffer");
+                return;
+            }
+
+            if ("all" == tel_rest) {
+                ppp::telemetry::SetConsoleLogEnabled(true);
+                ppp::telemetry::SetConsoleMetricEnabled(true);
+                ppp::telemetry::SetConsoleSpanEnabled(true);
+                emit_state();
+                return;
+            }
+
+            if ("quiet" == tel_rest) {
+                ppp::telemetry::SetConsoleLogEnabled(false);
+                ppp::telemetry::SetConsoleMetricEnabled(false);
+                ppp::telemetry::SetConsoleSpanEnabled(false);
+                emit_state();
+                return;
+            }
+
+            if ("clear" == tel_rest) {
+                ClearTelemetryEventLines();
+                AppendLine("Telemetry event buffer cleared.");
+                return;
+            }
+
+            // Tokenize: expect "log|metric|span on|off|toggle" or "level N"
+            ppp::vector<ppp::string> tokens;
+            ppp::Tokenize(tel_rest, tokens, ppp::string(" "));
+
+            // Known first-token check for targeted usage messages.
+            auto is_known_tel_sub = [](const ppp::string& t) noexcept -> bool {
+                return "log" == t || "metric" == t || "span" == t || "level" == t;
+            };
+
+            // Wrong number of arguments for a known sub-command → print usage
+            // instead of falling through to the generic "Unknown" message.
+            if (!tokens.empty() && is_known_tel_sub(tokens[0]) && 2u != tokens.size()) {
+                if ("level" == tokens[0]) {
+                    AppendLine("Usage: openppp2 telemetry level 0|1|2|3");
+                } else {
+                    AppendLine("Usage: openppp2 telemetry " + tokens[0] + " on|off|toggle");
+                }
+                return;
+            }
+
+            if (2u == tokens.size()) {
+                if ("log" == tokens[0]) {
+                    if ("on" == tokens[1]) {
+                        ppp::telemetry::SetConsoleLogEnabled(true);
+                    } elif ("off" == tokens[1]) {
+                        ppp::telemetry::SetConsoleLogEnabled(false);
+                    } elif ("toggle" == tokens[1]) {
+                        ppp::telemetry::SetConsoleLogEnabled(!ppp::telemetry::IsConsoleLogEnabled());
+                    } else {
+                        AppendLine("Usage: openppp2 telemetry log on|off|toggle");
+                        return;
+                    }
+                    emit_state();
+                    return;
+                }
+
+                if ("metric" == tokens[0]) {
+                    if ("on" == tokens[1]) {
+                        ppp::telemetry::SetConsoleMetricEnabled(true);
+                    } elif ("off" == tokens[1]) {
+                        ppp::telemetry::SetConsoleMetricEnabled(false);
+                    } elif ("toggle" == tokens[1]) {
+                        ppp::telemetry::SetConsoleMetricEnabled(!ppp::telemetry::IsConsoleMetricEnabled());
+                    } else {
+                        AppendLine("Usage: openppp2 telemetry metric on|off|toggle");
+                        return;
+                    }
+                    emit_state();
+                    return;
+                }
+
+                if ("span" == tokens[0]) {
+                    if ("on" == tokens[1]) {
+                        ppp::telemetry::SetConsoleSpanEnabled(true);
+                    } elif ("off" == tokens[1]) {
+                        ppp::telemetry::SetConsoleSpanEnabled(false);
+                    } elif ("toggle" == tokens[1]) {
+                        ppp::telemetry::SetConsoleSpanEnabled(!ppp::telemetry::IsConsoleSpanEnabled());
+                    } else {
+                        AppendLine("Usage: openppp2 telemetry span on|off|toggle");
+                        return;
+                    }
+                    emit_state();
+                    return;
+                }
+
+                if ("level" == tokens[0]) {
+                    if (1u == tokens[1].size() && tokens[1][0] >= '0' && tokens[1][0] <= '3') {
+                        ppp::telemetry::SetMinLevel(tokens[1][0] - '0');
+                        emit_state();
+                        return;
+                    }
+                    AppendLine("Usage: openppp2 telemetry level 0|1|2|3");
+                    return;
+                }
+            }
+
+            AppendLine("Unknown telemetry sub-command: '" + tel_rest + "'");
+            AppendLine("Type 'openppp2 telemetry help' for telemetry commands.");
             return;
         }
 
@@ -1883,10 +2204,6 @@ void ConsoleUI::InputLoop() noexcept {
         }
 
         if (32 <= ch && 126 >= ch) {
-            if (HandleTelemetryHotkey(static_cast<char>(ch))) {
-                MarkDirty();
-                continue;
-            }
             InsertInputChar(static_cast<char>(ch));
         }
     }
@@ -1982,10 +2299,6 @@ void ConsoleUI::InputLoop() noexcept {
         }
 
         if (32 <= static_cast<unsigned char>(ch) && 126 >= static_cast<unsigned char>(ch)) {
-            if (HandleTelemetryHotkey(ch)) {
-                MarkDirty();
-                continue;
-            }
             InsertInputChar(ch);
         }
     }
@@ -1999,6 +2312,11 @@ void ConsoleUI::InputLoop() noexcept {
 
 bool ConsoleUI::EnableVirtualTerminal() noexcept {
 #if defined(_WIN32)
+    // UTF-8 is needed only when Unicode UI glyphs are explicitly enabled.
+    if (UseUnicodeUiGlyphs()) {
+        ::SetConsoleOutputCP(CP_UTF8);
+    }
+
     HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
     if (NULLPTR == h || INVALID_HANDLE_VALUE == h) {
         ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::RuntimeEnvironmentInvalid);

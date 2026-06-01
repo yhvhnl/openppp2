@@ -45,6 +45,18 @@ namespace ppp {
         static constexpr int EVP_HEADER_MSS = EVP_HEADER_TSS + 1; // 3 bytes: total header after first key byte
         static constexpr int EVP_HEADER_XSS = EVP_HEADER_MSS + 1; // 4 bytes: simple header (random key + filler + swapped length)
 
+        // Maximum base94-encoded frame payload size.
+        //
+        // ssea::base94_encode() encodes input byte-by-byte: a byte whose (value - kf)
+        // is >= 93 expands to 2 output characters, otherwise 1.  In the worst case every
+        // byte expands, so the encoded size is up to 2x the binary input.  A binary
+        // payload bounded by PPP_BUFFER_SIZE can therefore produce up to 2*PPP_BUFFER_SIZE
+        // encoded bytes.  The receive-side frame-length check must allow this full
+        // expansion; the decoded output is still bounded by PPP_BUFFER_SIZE in the
+        // binary decrypt path.  (NOTE: this is NOT 11/9 — that ratio belongs to the
+        // unrelated block-based BASE94_INPUT/OUTPUT_BLOCK_SIZE codec, not this byte codec.)
+        static constexpr int EVP_BASE94_MAX_FRAME = (PPP_BUFFER_SIZE * 2) + 64;
+
         // Forward declaration of the full packet read helper (used by ReadBinary).
         static std::shared_ptr<Byte> Transmission_Packet_Read(
             const AppConfigurationPtr&                  APP,
@@ -434,8 +446,24 @@ namespace ppp {
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid, NULLPTR);
                 }
 
-                /** @brief Frame length upper-bound check (P0-4A): reject in-memory base94 frames exceeding PPP_BUFFER_SIZE. */
-                if (payload_length > PPP_BUFFER_SIZE) {
+                /**
+                 * @brief Frame length upper-bound check (P0-4A): reject in-memory base94 frames
+                 *        exceeding the encoded ceiling.
+                 *
+                 * @details The send side caps plaintext/base94 TCP chunks (see
+                 *          VirtualEthernetTcpipConnection / vmux_skt) so a conforming peer never
+                 *          emits a frame this large.  We accept up to EVP_BASE94_MAX_FRAME
+                 *          (2 * PPP_BUFFER_SIZE, the worst-case byte-codec expansion) rather than
+                 *          the raw PPP_BUFFER_SIZE, so a peer running an older, un-capped build
+                 *          that emits a full-expansion frame still interoperates.  The decoded
+                 *          output is re-bounded by PPP_BUFFER_SIZE in the binary decrypt path.
+                 */
+                if (payload_length > EVP_BASE94_MAX_FRAME) {
+                    ppp::telemetry::Log(Level::kInfo,
+                        "transmission",
+                        "base94 frame too large payload_length=%d max=%d in_memory=yes",
+                        payload_length,
+                        EVP_BASE94_MAX_FRAME);
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid, NULLPTR);
                 }
 
@@ -539,8 +567,13 @@ namespace ppp {
                     return NULLPTR;
                 }
 
-                /** @brief Frame length upper-bound check (P0-4A): reject frames that exceed PPP_BUFFER_SIZE. */
-                if (payload_length > PPP_BUFFER_SIZE) {
+                /** @brief Frame length upper-bound check (P0-4A): reject base94 frames that exceed the encoded ceiling. */
+                if (payload_length > EVP_BASE94_MAX_FRAME) {
+                    ppp::telemetry::Log(Level::kInfo,
+                        "transmission",
+                        "base94 frame too large payload_length=%d max=%d in_memory=no",
+                        payload_length,
+                        EVP_BASE94_MAX_FRAME);
                     return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::ProtocolFrameInvalid, NULLPTR);
                 }
 
@@ -1272,6 +1305,16 @@ namespace ppp {
                 else {
                     ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::TunnelReadFailed);
                 }
+            }
+
+            if (NULLPTR == result) {
+                ppp::telemetry::Log(Level::kInfo,
+                    "transmission",
+                    "Read failed outlen=%d error=%d disposed=%s finalized=%s",
+                    outlen,
+                    (int)ppp::diagnostics::GetLastErrorCode(),
+                    disposed_.load(std::memory_order_acquire) ? "yes" : "no",
+                    finalized_.load(std::memory_order_acquire) ? "yes" : "no");
             }
 
             return result;
