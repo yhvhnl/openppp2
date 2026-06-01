@@ -1305,9 +1305,10 @@ namespace vmux {
      *           FLOW_V2), it stays on a single primary link, because compat global
      *           ordering would treat cross-link reordering as loss. */
     bool vmux_net::process_tx_flow_packets() noexcept {
-        // FLOW_V2 negotiated: per-connection sticky spread across all links.
+        // FLOW_V2 negotiated: per-connection sticky spread across all links, with
+        // strict affinity (a busy link does not fall back — preserves per-flow order).
         if (ordering_mode_ == ordering_flow_v2) {
-            return process_tx_balance_packets();
+            return process_tx_balance_packets(true /* strict_affinity */);
         }
 
         // COMPAT fallback: single primary link (legacy flow behavior).
@@ -1445,10 +1446,9 @@ namespace vmux {
      *          receiver-side head-of-line blocking (see issue #5 design notes).
      */
     /** @brief Drains queued packets with per-connection sticky link selection (balance). */
-    bool vmux_net::process_tx_balance_packets() noexcept {
+    bool vmux_net::process_tx_balance_packets(bool strict_affinity) noexcept {
         for (;;) {
-            tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
-            if (packet_tail == tx_queue_.end()) {
+            if (tx_queue_.empty()) {
                 return true;
             }
 
@@ -1457,27 +1457,85 @@ namespace vmux {
                 return true;
             }
 
-            uint32_t connection_id = peek_connection_id(packet_tail->buffer, packet_tail->length);
-            vmux_linklayer_ptr linklayer = select_affinity_linklayer(connection_id);
-            if (NULLPTR == linklayer) {
-                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
-                return false;
-            }
+            // Find the next frame we can send now. In strict mode (flow v2), a frame
+            // whose affinity link is busy is skipped over so that OTHER connections
+            // (whose links are free) are not head-of-line blocked behind it; the
+            // skipped connection keeps its FIFO order because we never advance past
+            // an earlier frame of the SAME connection. In non-strict mode we always
+            // take the head (busy links fall back below).
+            tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
+            tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
+            vmux_linklayer_ptr linklayer;
+            vmux_linklayer_list::iterator link_tail = tx_links_.end();
+            bool found = false;
 
-            // Honor the credit scheme: only send now if the chosen link is free.
-            // Otherwise leave the frame queued; a free link's completion will
-            // re-drive process_tx_all_packets and pick it up shortly.
-            vmux_linklayer_list::iterator link_tail = tx_links_.begin();
-            vmux_linklayer_list::iterator link_endl = tx_links_.end();
-            while (link_tail != link_endl && *link_tail != linklayer) {
-                ++link_tail;
-            }
+            if (strict_affinity) {
+                vmux::unordered_map<uint32_t, bool> deferred; // connections already deferred this pass.
+                for (tx_packet_ssqueue::iterator it = packet_tail; it != packet_endl; ++it) {
+                    uint32_t cid = peek_connection_id(it->buffer, it->length);
 
-            if (link_tail == link_endl) {
-                // Sticky link is busy; fall back to any free link to avoid stalling
-                // throughput. Correctness is preserved by the global sequence number.
-                linklayer = *tx_links_.begin();
-                link_tail = tx_links_.begin();
+                    // Preserve per-connection FIFO: once a connection is deferred
+                    // (its link busy), do not send any later frame of that same
+                    // connection in this pass.
+                    if (cid != 0 && deferred.find(cid) != deferred.end()) {
+                        continue;
+                    }
+
+                    vmux_linklayer_ptr candidate = select_affinity_linklayer(cid);
+                    if (NULLPTR == candidate) {
+                        ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
+                        return false;
+                    }
+
+                    vmux_linklayer_list::iterator lt = tx_links_.begin();
+                    vmux_linklayer_list::iterator le = tx_links_.end();
+                    while (lt != le && *lt != candidate) {
+                        ++lt;
+                    }
+
+                    if (lt == le) {
+                        // Affinity link busy: defer this connection, keep scanning.
+                        if (cid != 0) {
+                            deferred[cid] = true;
+                        }
+                        continue;
+                    }
+
+                    packet_tail = it;
+                    linklayer = candidate;
+                    link_tail = lt;
+                    found = true;
+                    break;
+                }
+
+                if (!found) {
+                    // No connection has a free affinity link right now; their own
+                    // send completions will re-drive this drain. Nothing to do.
+                    return true;
+                }
+            }
+            else {
+                uint32_t connection_id = peek_connection_id(packet_tail->buffer, packet_tail->length);
+                linklayer = select_affinity_linklayer(connection_id);
+                if (NULLPTR == linklayer) {
+                    ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
+                    return false;
+                }
+
+                vmux_linklayer_list::iterator lt = tx_links_.begin();
+                vmux_linklayer_list::iterator le = tx_links_.end();
+                while (lt != le && *lt != linklayer) {
+                    ++lt;
+                }
+
+                if (lt == le) {
+                    // balance/compat: sticky link busy; fall back to any free link to
+                    // avoid stalling throughput. Correctness is preserved by the
+                    // global sequence number — never taken under flow v2.
+                    linklayer = *tx_links_.begin();
+                    lt = tx_links_.begin();
+                }
+                link_tail = lt;
             }
 
             tx_links_.erase(link_tail);
@@ -1540,7 +1598,7 @@ namespace vmux {
         case mux_mode_flow:
             return process_tx_flow_packets();
         case mux_mode_balance:
-            return process_tx_balance_packets();
+            return process_tx_balance_packets(false /* strict_affinity */);
         case mux_mode_stripe:
             return process_tx_stripe_packets();
         default:
@@ -1918,7 +1976,7 @@ namespace vmux {
 
         // Guard Suspend() behind the post result: if the executor is unavailable the
         // lambda (and every ppp::coroutines::asio::R() inside it) will never run, so
-        // calling Suspend() would park the coroutine with no future Resume() �?a
+        // calling Suspend() would park the coroutine with no future Resume() �?a
         // permanent coroutine leak.
         bool posted = vmux_post_exec(context_, strand_,
             [this, sk, host, port, status, context, strand, return_connection, &y]() noexcept {

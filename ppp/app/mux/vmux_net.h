@@ -449,8 +449,13 @@ namespace vmux {
         bool                                                                        process_tx_compat_packets() noexcept;
         /** @brief Drain queued transmit packets through one primary link. */
         bool                                                                        process_tx_flow_packets() noexcept;
-        /** @brief Drain queued transmit packets with per-connection sticky link selection. */
-        bool                                                                        process_tx_balance_packets() noexcept;
+        /** @brief Drain queued transmit packets with per-connection sticky link selection.
+         *  @param strict_affinity When true (flow v2), a busy affinity link leaves the
+         *         frame queued instead of falling back to another link, so a
+         *         connection's frames never cross links and the receiver's per-flow
+         *         DSN ordering is preserved. When false (balance/compat), a busy link
+         *         falls back to any free link to maximize utilization. */
+        bool                                                                        process_tx_balance_packets(bool strict_affinity) noexcept;
         /** @brief Drain queued transmit packets striped round-robin across links. */
         bool                                                                        process_tx_stripe_packets() noexcept;
 
