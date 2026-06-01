@@ -266,16 +266,17 @@ namespace vmux {
             return cmd == cmd_push || cmd == cmd_fin;
         }
         /**
-         * @brief True for scheduler modes that spread one session's frames across
-         *        multiple links and therefore require per-flow receiver ordering.
-         * @details flow/balance/stripe distribute frames over more than one
-         *          link-layer, so the receiver must order each connection
-         *          independently (FLOW_V2) to avoid cross-link reordering being
-         *          mistaken for loss under the single global compat sequence.
-         *          compat keeps the legacy single-sequence behavior.
+         * @brief True for scheduler modes that use negotiated per-flow receiver
+         *        ordering (flow v2 / balance).
+         * @details balance spreads one session's frames across links by competition
+         *          (any free link sends any frame) and relies on the receiver
+         *          reordering each connection independently by per-flow DSN, so
+         *          cross-link reordering is not mistaken for loss. stripe (legacy,
+         *          experimental) likewise needs per-flow reordering. compat and flow
+         *          use the single global sequence (no per-flow reordering).
          */
         static bool                                                                 mode_requires_flow_v2(mux_mode mode) noexcept {
-            return mode == mux_mode_flow || mode == mux_mode_balance || mode == mux_mode_stripe;
+            return mode == mux_mode_balance || mode == mux_mode_stripe;
         }
         /**
          * @brief Push a debug-only mux-mode change request to the peer.
@@ -458,13 +459,13 @@ namespace vmux {
         bool                                                                        process_tx_ctrl_packets() noexcept;
         /** @brief Drain queued transmit packets through one primary link. */
         bool                                                                        process_tx_flow_packets() noexcept;
-        /** @brief Drain queued transmit packets with per-connection sticky link selection.
-         *  @param strict_affinity When true (flow v2), a busy affinity link leaves the
-         *         frame queued instead of falling back to another link, so a
-         *         connection's frames never cross links and the receiver's per-flow
-         *         DSN ordering is preserved. When false (balance/compat), a busy link
-         *         falls back to any free link to maximize utilization. */
-        bool                                                                        process_tx_balance_packets(bool strict_affinity) noexcept;
+        /** @brief Drain queued transmit packets using the competition scheduler
+         *  for balance mode. Identical send-side policy to compat (any free link
+         *  sends the next queued frame — no per-connection binding); the difference
+         *  is that balance negotiates per-flow receiver ordering (flow v2) so each
+         *  connection is reordered independently on receive, removing cross-flow
+         *  head-of-line blocking without pinning connections to links. */
+        bool                                                                        process_tx_balance_packets() noexcept;
         /** @brief Drain queued transmit packets striped round-robin across links. */
         bool                                                                        process_tx_stripe_packets() noexcept;
 

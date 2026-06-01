@@ -134,7 +134,7 @@ namespace ppp {
                 ppp::string                                                 mode;           ///< MUX transmit scheduler mode: compat or flow.
                 int                                                         congestions;    ///< MUX congestion control level; higher values reduce burst aggressiveness.
                 int                                                         keep_alived[2]; ///< MUX keep-alive interval range [min, max] in seconds.
-                bool                                                        flow_v2;        ///< Enable negotiated per-flow receiver ordering (flow v2); default false.
+                bool                                                        turbo;          ///< flow-mode turbo: best-link-first first packet + prewarmed carrier links (--mux-mode-turbo); default false.
                 struct {
                     struct {
                         int                                                 bytes;          ///< Per-connection reorder buffer byte cap (flow v2); strictly > 0.

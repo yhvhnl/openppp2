@@ -289,7 +289,7 @@ namespace ppp {
             config.mux.congestions = PPP_MUX_DEFAULT_CONGESTIONS;
             config.mux.keep_alived[0] = PPP_TCP_CONNECT_TIMEOUT;
             config.mux.keep_alived[1] = PPP_MUX_CONNECT_TIMEOUT;
-            config.mux.flow_v2 = false;
+            config.mux.turbo = false;
             config.mux.flow.reorder.bytes = PPP_MUX_FLOW_REORDER_BYTES;
             config.mux.flow.reorder.timeout = PPP_MUX_FLOW_REORDER_TIMEOUT;
             config.mux.tx.queue.max = PPP_MUX_TX_QUEUE_HIGH_WATER;
@@ -1619,7 +1619,7 @@ namespace ppp {
             config.mux.connect.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["connect"]["timeout"]);
             config.mux.congestions = (int)JsonAuxiliary::AsInt64(json["mux"]["congestions"], -1);
             config.mux.mode = JsonAuxiliary::AsValue<ppp::string>(json["mux"]["mode"]);
-            config.mux.flow_v2 = JsonAuxiliary::AsValue<bool>(json["mux"]["flow-v2"]);
+            config.mux.turbo = JsonAuxiliary::AsValue<bool>(json["mux"]["turbo"]);
             config.mux.flow.reorder.bytes = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["bytes"]);
             config.mux.flow.reorder.timeout = JsonAuxiliary::AsValue<int>(json["mux"]["flow"]["reorder"]["timeout"]);
             config.mux.tx.queue.max = JsonAuxiliary::AsValue<int>(json["mux"]["tx"]["queue"]["max"]);
@@ -1927,7 +1927,7 @@ namespace ppp {
             mux["connect"]["timeout"] = config.mux.connect.timeout;
             mux["congestions"] = config.mux.congestions;
             mux["mode"] = config.mux.mode;
-            mux["flow-v2"] = config.mux.flow_v2;
+            mux["turbo"] = config.mux.turbo;
             mux["flow"]["reorder"]["bytes"] = config.mux.flow.reorder.bytes;
             mux["flow"]["reorder"]["timeout"] = config.mux.flow.reorder.timeout;
             mux["tx"]["queue"]["max"] = config.mux.tx.queue.max;

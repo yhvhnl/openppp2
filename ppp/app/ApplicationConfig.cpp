@@ -52,6 +52,12 @@ int PppApplication::PreparedArgumentEnvironment(int argc, const char* argv[]) no
         }
     }
 
+    // flow-mode turbo: best-link-first first packet + prewarmed carrier links.
+    // Opt-in (default off); only meaningful under --mux-mode=flow.
+    if (ppp::HasCommandArgument("--mux-mode-turbo", argc, argv)) {
+        configuration->mux.turbo = ppp::ToBoolean(ppp::GetCommandArgument("--mux-mode-turbo", argc, argv).data());
+    }
+
     /**
      * @brief Debug-only remote mux-mode control (opt-in).
      *

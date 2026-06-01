@@ -830,14 +830,11 @@ namespace ppp {
                             bool ok = false;
                             if (!disposed_.load(std::memory_order_acquire)) {
                                 uint16_t max_connections = mux->get_max_connections();
-                                // Advertise FLOW_V2 capability when locally enabled OR when the
-                                // active scheduler mode spreads frames across multiple links
-                                // (flow/balance/stripe), which requires per-flow receiver
-                                // ordering for correctness. The server echoes back the agreed
-                                // result in its MUX reply (see OnMux); negotiation stays an
-                                // intersection so an older peer transparently falls back to compat.
-                                bool advertise_flow_v2 = NULLPTR != configuration &&
-                                    (configuration->mux.flow_v2 || vmux::vmux_net::mode_requires_flow_v2(mux->get_mode()));
+                                // Advertise per-flow (flow v2) receiver ordering when the active
+                                // scheduler mode needs it (balance/stripe). The server echoes the
+                                // agreed result in its MUX reply (see OnMux); negotiation is an
+                                // intersection, so an older peer transparently falls back to compat.
+                                bool advertise_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(mux->get_mode());
                                 Byte ordering_caps = advertise_flow_v2
                                     ? (Byte)vmux::vmux_net::ordering_caps_flow_v2 : (Byte)0;
                                 ok = DoMux(vnet_transmission, mux->Vlan, max_connections, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_REMOTE) != 0, ordering_caps, y);
@@ -1104,12 +1101,10 @@ namespace ppp {
 
                             // Apply the negotiated receiver ordering mode (flow v2) before linking.
                             // The server echoes the agreed capability in its MUX reply; agreed
-                            // FLOW_V2 requires this end to also have it enabled (fail-safe to compat).
-                            // "Enabled" means either the explicit mux.flow-v2 switch OR an active
-                            // cross-link scheduler mode (flow/balance/stripe) that needs per-flow
-                            // ordering for correctness.
-                            bool local_supports_flow_v2 = NULLPTR != configuration &&
-                                (configuration->mux.flow_v2 || vmux::vmux_net::mode_requires_flow_v2(mux->get_mode()));
+                            // FLOW_V2 requires this end to also need it — i.e. an active scheduler
+                            // mode that uses per-flow ordering (balance/stripe). Fail-safe: any
+                            // mismatch or older peer falls back to compat global ordering.
+                            bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(mux->get_mode());
                             bool agreed_flow_v2 = local_supports_flow_v2 && ((ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0);
                             mux->set_ordering_mode(agreed_flow_v2 ? vmux::vmux_net::ordering_flow_v2 : vmux::vmux_net::ordering_compat);
 

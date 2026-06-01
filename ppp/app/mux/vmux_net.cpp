@@ -418,15 +418,12 @@ namespace vmux {
                 }
 
                 if (ok) {
-                    // The per-packet policy drain (balance/stripe, and flow once
-                    // FLOW_V2 is negotiated) re-selects the link for every frame:
-                    // return this link's send credit and let the scheduler route
-                    // the next queued frame by policy. The single-link drain
-                    // (compat, and flow when it fell back to compat) keeps sending
-                    // the next frame on the same link to preserve global ordering.
-                    bool per_packet_policy_drain =
-                        mode_ == mux_mode_balance || mode_ == mux_mode_stripe ||
-                        (mode_ == mux_mode_flow && ordering_mode_ == ordering_flow_v2);
+                    // stripe picks a link per packet (round-robin), so on completion
+                    // it returns this link's credit and re-runs the scheduler to
+                    // route the next frame by policy. compat / flow / balance all use
+                    // the competition drain (driven from the free-link list): they
+                    // keep sending the next queued frame on this same just-freed link.
+                    bool per_packet_policy_drain = (mode_ == mux_mode_stripe);
                     if (per_packet_policy_drain) {
                         tx_links_.emplace_back(linklayer);
                         ok = process_tx_all_packets();
@@ -1357,55 +1354,16 @@ namespace vmux {
     }
 
     /** @brief Drains queued packets for flow mode.
-     *  @details When the session negotiated FLOW_V2 (per-flow receiver ordering),
-     *           frames are spread across links with per-connection stickiness
-     *           (same connection -> same link, preserving its DSN order; different
-     *           connections -> different links) so one connection's bulk transfer
-     *           cannot head-of-line block another connection's first packets.
-     *           When ordering is COMPAT (e.g. an older peer that did not negotiate
-     *           FLOW_V2), it stays on a single primary link, because compat global
-     *           ordering would treat cross-link reordering as loss. */
+     *  @details flow is the latency-oriented "new direction": pure competition on
+     *           the send side (any free link sends the next queued frame — no
+     *           per-connection binding, which would risk load imbalance and the
+     *           single-TCP degeneration the competition model is designed to avoid),
+     *           with global ordering on receive (no per-flow reordering wait). The
+     *           optional turbo path (best-link-first first packet + prewarmed carrier
+     *           links) layers on top via --mux-mode-turbo without changing this
+     *           competition core. */
     bool vmux_net::process_tx_flow_packets() noexcept {
-        // FLOW_V2 negotiated: per-connection sticky spread across all links, with
-        // strict affinity (a busy link does not fall back — preserves per-flow order).
-        if (ordering_mode_ == ordering_flow_v2) {
-            return process_tx_balance_packets(true /* strict_affinity */);
-        }
-
-        // COMPAT fallback: single primary link (legacy flow behavior).
-        tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
-        tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
-        if (packet_tail == packet_endl) {
-            return true;
-        }
-
-        vmux_linklayer_ptr linklayer = select_primary_linklayer();
-        if (NULLPTR == linklayer) {
-            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
-            return false;
-        }
-
-        vmux_linklayer_list::iterator linklayer_tail = tx_links_.begin();
-        vmux_linklayer_list::iterator linklayer_endl = tx_links_.end();
-        while (linklayer_tail != linklayer_endl && *linklayer_tail != linklayer) {
-            ++linklayer_tail;
-        }
-
-        if (linklayer_tail == linklayer_endl) {
-            return true;
-        }
-
-        tx_links_.erase(linklayer_tail);
-        tx_packet nexting_packet = *packet_tail;
-        tx_queue_.erase(packet_tail);
-
-        bool forwarding = underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac);
-        if (!forwarding) {
-            ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
-            return false;
-        }
-
-        return true;
+        return process_tx_compat_packets();
     }
 
     /** @brief Reads the connection_id field stored in a queued vmux frame buffer. */
@@ -1506,109 +1464,20 @@ namespace vmux {
      *          order; balance/stripe improve link utilization but do not remove
      *          receiver-side head-of-line blocking (see issue #5 design notes).
      */
-    /** @brief Drains queued packets with per-connection sticky link selection (balance). */
-    bool vmux_net::process_tx_balance_packets(bool strict_affinity) noexcept {
-        for (;;) {
-            if (tx_queue_.empty()) {
-                return true;
-            }
-
-            // Only dispatch while at least one link has send credit available.
-            if (tx_links_.empty()) {
-                return true;
-            }
-
-            // Find the next frame we can send now. In strict mode (flow v2), a frame
-            // whose affinity link is busy is skipped over so that OTHER connections
-            // (whose links are free) are not head-of-line blocked behind it; the
-            // skipped connection keeps its FIFO order because we never advance past
-            // an earlier frame of the SAME connection. In non-strict mode we always
-            // take the head (busy links fall back below).
-            tx_packet_ssqueue::iterator packet_tail = tx_queue_.begin();
-            tx_packet_ssqueue::iterator packet_endl = tx_queue_.end();
-            vmux_linklayer_ptr linklayer;
-            vmux_linklayer_list::iterator link_tail = tx_links_.end();
-            bool found = false;
-
-            if (strict_affinity) {
-                vmux::unordered_map<uint32_t, bool> deferred; // connections already deferred this pass.
-                for (tx_packet_ssqueue::iterator it = packet_tail; it != packet_endl; ++it) {
-                    uint32_t cid = peek_connection_id(it->buffer, it->length);
-
-                    // Preserve per-connection FIFO: once a connection is deferred
-                    // (its link busy), do not send any later frame of that same
-                    // connection in this pass.
-                    if (cid != 0 && deferred.find(cid) != deferred.end()) {
-                        continue;
-                    }
-
-                    vmux_linklayer_ptr candidate = select_affinity_linklayer(cid);
-                    if (NULLPTR == candidate) {
-                        ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
-                        return false;
-                    }
-
-                    vmux_linklayer_list::iterator lt = tx_links_.begin();
-                    vmux_linklayer_list::iterator le = tx_links_.end();
-                    while (lt != le && *lt != candidate) {
-                        ++lt;
-                    }
-
-                    if (lt == le) {
-                        // Affinity link busy: defer this connection, keep scanning.
-                        if (cid != 0) {
-                            deferred[cid] = true;
-                        }
-                        continue;
-                    }
-
-                    packet_tail = it;
-                    linklayer = candidate;
-                    link_tail = lt;
-                    found = true;
-                    break;
-                }
-
-                if (!found) {
-                    // No connection has a free affinity link right now; their own
-                    // send completions will re-drive this drain. Nothing to do.
-                    return true;
-                }
-            }
-            else {
-                uint32_t connection_id = peek_connection_id(packet_tail->buffer, packet_tail->length);
-                linklayer = select_affinity_linklayer(connection_id);
-                if (NULLPTR == linklayer) {
-                    ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionTransportMissing);
-                    return false;
-                }
-
-                vmux_linklayer_list::iterator lt = tx_links_.begin();
-                vmux_linklayer_list::iterator le = tx_links_.end();
-                while (lt != le && *lt != linklayer) {
-                    ++lt;
-                }
-
-                if (lt == le) {
-                    // balance/compat: sticky link busy; fall back to any free link to
-                    // avoid stalling throughput. Correctness is preserved by the
-                    // global sequence number — never taken under flow v2.
-                    linklayer = *tx_links_.begin();
-                    lt = tx_links_.begin();
-                }
-                link_tail = lt;
-            }
-
-            tx_links_.erase(link_tail);
-
-            tx_packet nexting_packet = *packet_tail;
-            tx_queue_.erase(packet_tail);
-
-            if (!underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac)) {
-                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
-                return false;
-            }
-        }
+    /**
+     * @brief Send-side scheduling for balance mode.
+     * @details balance uses the same competition policy as compat (any link with
+     *          send credit sends the next queued frame; no per-connection binding).
+     *          Per-connection link binding was removed deliberately: pinning a
+     *          connection to a link makes load unpredictable and, in the worst case
+     *          (several heavy flows landing on one link), degenerates to a single
+     *          TCP — defeating multi-link VMUX. Instead balance keeps competition on
+     *          send and adds per-flow DSN reordering on receive (negotiated flow v2),
+     *          so a slow/blocked connection only head-of-line blocks itself, not the
+     *          others, while every link stays fully and adaptively utilized.
+     */
+    bool vmux_net::process_tx_balance_packets() noexcept {
+        return process_tx_compat_packets();
     }
 
     /** @brief Drains queued packets striped round-robin across links (stripe). */
@@ -1695,7 +1564,7 @@ namespace vmux {
         case mux_mode_flow:
             return process_tx_flow_packets();
         case mux_mode_balance:
-            return process_tx_balance_packets(false /* strict_affinity */);
+            return process_tx_balance_packets();
         case mux_mode_stripe:
             return process_tx_stripe_packets();
         default:

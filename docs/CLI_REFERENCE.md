@@ -265,35 +265,41 @@ Valid values depend on the build configuration.
 
 ### `--mux-mode=<compat|flow|balance|stripe>`
 
-MUX scheduler mode. It selects how queued frames are spread across the underlying mux
-linklayers. `compat` is a pure send-side policy under the single global VMUX sequence/ack
-window. `flow`, `balance`, and `stripe` spread one session's frames across multiple links
-and therefore **auto-negotiate per-flow receiver ordering (flow v2)** so cross-link
-reordering is not mistaken for loss. That negotiation is an intersection: it only engages
-when **both** peers run a build that supports it; otherwise the session transparently
-falls back to single-link `compat`-ordered behavior. None of the modes change the wire
-format. Configure both peers the same way when you want matching behavior in both directions.
+MUX scheduler mode. All modes send by **competition** (any linklayer with send credit
+takes the next queued frame — no per-connection binding, which would risk load imbalance
+and degenerate to a single TCP under several heavy flows). Modes differ in receiver-side
+ordering and intent. None change the wire format. Configure both peers consistently.
 
 | Mode | Behavior | Use case |
 |------|----------|----------|
-| `compat` | Existing scheduler; queued frames go to whichever linklayer is free. | Default / rollback / regression baseline. |
-| `flow` | When flow v2 is negotiated, per-connection sticky spread across links: each connection is pinned to one link (preserving its per-flow order) while different connections use different links, so one connection's bulk transfer cannot head-of-line block another's first packets. Falls back to a single primary link against a peer that lacks flow v2. | Single-flow latency / first-byte responsiveness with multiple links. |
-| `balance` | Per-connection sticky load balancing: each logical connection is bound to a least-loaded active linklayer (round-robin on first use, migrates if the link drops); frames within a connection stay on that link when it has send credit. Auto-negotiates flow v2. | Many concurrent connections wanting throughput spread across links. |
-| `stripe` | Experimental striping: queued frames are distributed round-robin across all active linklayers regardless of connection. Auto-negotiates flow v2. | Future pseudo-MPTCP / 9000-MTU work. |
+| `compat` | Original upstream behavior: competition send + single global sequence/ack ordering on receive. One connection's gap head-of-line blocks all connections. | Default / rollback / regression baseline. |
+| `flow` | Latency-oriented direction: competition send + global ordering. Optional `--mux-mode-turbo` layers best-link-first first-packet and prewarmed carrier links on top for first-byte responsiveness, without per-connection binding. | Interactive / web / latency-sensitive use. |
+| `balance` | Competition send + **negotiated per-flow receiver ordering (flow v2)**: each connection is reordered independently by per-flow DSN, so a slow/blocked connection only head-of-line blocks itself, not the others — while every link stays fully and adaptively utilized (no binding). | Many concurrent connections wanting throughput with per-flow isolation. |
+| `stripe` | Experimental: round-robin per-packet distribution + per-flow ordering. | Future pseudo-MPTCP / 9000-MTU work. |
 
-> **flow v2 requires both ends on a supporting build.** `flow`/`balance`/`stripe` only get
-> their multi-link benefit when the negotiation succeeds; with an older peer they fall back
-> to single-link delivery (no regression, but no improvement either). You can still force
-> the capability advertisement explicitly with `mux.flow-v2: true` in JSON.
+> **`balance`/`stripe` negotiate per-flow ordering and need both ends on a supporting
+> build.** Negotiation is an intersection; against an older peer the session falls back to
+> `compat` global ordering (no regression, no per-flow benefit). The trade-off of per-flow
+> ordering is that a connection's own frames may arrive out of order across links and wait
+> in a bounded reorder buffer up to `mux.flow.reorder.timeout`.
 >
-> **`stripe` caveat (experimental):** spreading one logical flow across links of different
-> speeds causes heavy reordering at the receiver (buffered in the per-flow reorder queue).
-> It can make single-flow performance *worse* than `compat`/`flow`. It is provided as an
-> experimental base for future per-link sequencing / DSN work, not as a fast path today.
+> **`stripe` caveat (experimental):** striping one flow across links of different speeds
+> causes heavy intra-connection reordering and can be *worse* than `compat`/`flow`. It is a
+> base for future per-link sequencing work, not a fast path today.
 
 Set `mux.mode` in JSON or pass `--mux-mode=flow` at startup (CLI overrides JSON).
 
 **Default:** `compat`
+
+### `--mux-mode-turbo=[yes|no]`
+
+flow-mode turbo (opt-in, default `no`; only meaningful under `--mux-mode=flow`). Sends a
+new connection's first packet over the currently best-quality carrier link (by heartbeat
+signal) and prewarms additional carrier links in the background to widen the competition
+pool — improving first-byte latency without pinning connections to links. Set `mux.turbo`
+in JSON or pass `--mux-mode-turbo=yes`.
+
+**Default:** `no`
 
 ### `--debug-key=<secret>` and `--mux-mode-set=<compat|flow|balance|stripe>`
 
