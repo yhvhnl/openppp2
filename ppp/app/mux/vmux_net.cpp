@@ -397,6 +397,16 @@ namespace vmux {
                     posted_ac(ok);
                 }
 
+                // Teardown guard: a send may complete after the session has been
+                // finalized (link flap, idle timeout, or peer close). finalize()
+                // clears tx_links_/tx_queue_ under syncobj_; touching them again
+                // from this strand callback (emplace_back / erase / re-drain) would
+                // race the teardown and operate on freed list nodes. Once disposed,
+                // drop the completion: there is nothing left to schedule.
+                if (base_.disposed_) {
+                    return;
+                }
+
                 if (ok) {
                     // The per-packet policy drain (balance/stripe, and flow once
                     // FLOW_V2 is negotiated) re-selects the link for every frame:
