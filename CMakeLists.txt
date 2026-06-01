@@ -452,10 +452,18 @@ IF(PLATFORM_SYSTEM_WINDOWS)
 ELSEIF(PLATFORM_SYSTEM_DARWIN)
     SET(BUILD_SHARED_LIBS ON) # System
 
+    # ASan diagnostic build drops jemalloc so the sanitizer's allocator
+    # interceptors are in effect; default build links jemalloc as before.
+    IF(ENABLE_ASAN)
+        SET(PPP_DARWIN_ALLOC_LIB "")
+    ELSE()
+        SET(PPP_DARWIN_ALLOC_LIB ${THIRD_PARTY_LIBRARY_DIR}/jemalloc/lib/libjemalloc.a)
+    ENDIF()
+
     TARGET_LINK_LIBRARIES(${NAME} 
         ${THIRD_PARTY_LIBRARY_DIR}/openssl/libssl.a 
         ${THIRD_PARTY_LIBRARY_DIR}/openssl/libcrypto.a 
-        ${THIRD_PARTY_LIBRARY_DIR}/jemalloc/lib/libjemalloc.a
+        ${PPP_DARWIN_ALLOC_LIB}
 
         dl
         pthread
