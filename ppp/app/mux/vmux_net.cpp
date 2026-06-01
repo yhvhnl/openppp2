@@ -189,6 +189,8 @@ namespace vmux {
         m->base_.acceleration_        = acceleration;
         
         m->status_.max_connections    = max_connections;
+        m->status_.pool_hard_max      = max_connections; // raised by turbo via set_pool_hard_max() before establishment.
+        m->status_.pool_current       = max_connections; // runtime target; equals base until the turbo controller moves it.
         m->status_.opened_connections = 0;
 
         m->status_.rx_ack_            = 0;
@@ -1702,7 +1704,7 @@ namespace vmux {
             return false;
         }
 
-        if (rx_links_.size() >= status_.max_connections) {
+        if (rx_links_.size() >= status_.pool_hard_max) {
             ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionQuotaExceeded);
             return false;
         }

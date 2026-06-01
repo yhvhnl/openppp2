@@ -531,7 +531,9 @@ namespace vmux {
 
         /** @brief Runtime counters, sequence values, and heartbeat timestamps. */
         struct {
-            uint16_t                                                                max_connections    = 0; ///< Maximum allowed logical connections.
+            uint16_t                                                                max_connections    = 0; ///< Initial/established carrier-link target (= --tun-mux base). Established fires at this count; unchanged on the wire.
+            uint16_t                                                                pool_hard_max      = 0; ///< Absolute upper bound on carrier links (turbo dynamic pool). Equals max_connections when turbo is off; base*factor when on. add_linklayer quota uses this.
+            uint16_t                                                                pool_current       = 0; ///< Current runtime target pool size (turbo controller), in [max_connections, pool_hard_max]. Equals max_connections when turbo off.
             uint16_t                                                                opened_connections = 0; ///< Currently active logical connection count.
 
             uint32_t                                                                rx_ack_            = 0; ///< Last acknowledged inbound sequence number.
