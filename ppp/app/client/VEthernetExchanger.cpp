@@ -1050,7 +1050,11 @@ namespace ppp {
                             bool bok = mux->do_yield(y,
                                 [self, mux, connection]() noexcept -> bool {
                                     vmux::vmux_net::vmux_linklayer_ptr linklayer;
-                                    return mux->add_linklayer_runtime(connection, linklayer);
+                                    vmux::vmux_net::vmux_native_add_linklayer_after_success_before_callback handling;
+                                    // add_linklayer detects the established session and
+                                    // attaches this as a single runtime link (one
+                                    // forwarding coroutine; no batch re-spawn).
+                                    return mux->add_linklayer(connection, linklayer, handling);
                                 });
 
                             if (!bok) {

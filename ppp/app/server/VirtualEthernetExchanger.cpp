@@ -430,6 +430,20 @@ namespace ppp {
                         mux->AppConfiguration = configuration;
                         mux->BufferAllocator = transmission->BufferAllocator;
 
+                        // turbo dynamic pool: the client may grow its carrier pool past
+                        // the negotiated base at runtime. The client's turbo flag is
+                        // not on the wire, so the server cannot know it; raise the
+                        // ceiling for any flow-mode session (the ceiling is only a
+                        // safety cap — accepting the extra ConnectMux links is benign,
+                        // and a non-turbo client simply never sends them).
+                        if (mux_mode == vmux::vmux_net::mux_mode_flow) {
+                            uint32_t hard = (uint32_t)max_connections * (uint32_t)PPP_MUX_TURBO_FACTOR_MAX;
+                            if (hard > UINT16_MAX) {
+                                hard = UINT16_MAX;
+                            }
+                            mux->set_pool_hard_max((uint16_t)hard);
+                        }
+
                         // Apply the negotiated ordering mode before the session is established.
                         mux->set_ordering_mode(agreed);
 

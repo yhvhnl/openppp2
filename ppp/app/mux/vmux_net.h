@@ -327,24 +327,6 @@ namespace vmux {
             const vmux_native_add_linklayer_after_success_before_callback&          cb) noexcept;
 
         /**
-         * @brief Add ONE carrier link to an already-established session at runtime
-         *        (turbo dynamic pool grow, C-B3).
-         * @param connection A fully connected + ConnectMux'd transport.
-         * @param linklayer  Receives the created link-layer on success.
-         * @return true when the link was added and its single forwarding coroutine
-         *         spawned.
-         * @details Distinct from add_linklayer(): it adds exactly one link and
-         *          spawns exactly one forwarding coroutine for it — it NEVER iterates
-         *          rx_links_ to spawn (which would double-forward existing links).
-         *          Must run on the vmux strand. Respects pool_hard_max. The spawned
-         *          coroutine tears the session down on failure only when the link is
-         *          not retiring (a retired link ending is normal).
-         */
-        bool                                                                        add_linklayer_runtime(
-            const VirtualEthernetTcpipConnectionPtr&                                connection,
-            vmux_linklayer_ptr&                                                     linklayer) noexcept;
-
-        /**
          * @brief Begin retiring one carrier link at runtime (turbo dynamic pool
          *        shrink, C-B4). Strand-affine.
          * @return true when a link was marked for retirement.
