@@ -23,6 +23,42 @@ The cost is structural and cannot be removed, only mitigated:
 
 ---
 
+## Direction correction: back to the competition model (2026-06, per maintainer review)
+
+This section records an important course correction to prevent repeating the mistake.
+
+### Review conclusion (maintainer)
+
+Early versions of the multi-link flow rework used **per-connection → link binding (affinity)** to spread load (the early `flow`/`balance` strict affinity). The maintainer flagged this as a **negative optimization**:
+
+1. **Binding makes load unpredictable**: a link is lightly loaded at assignment time, but once a connection is pinned to it and that connection turns into a heavy flow (download/streaming), it is locked to that link; the link may have several heavy flows bound to it → backlog → drags the whole system down.
+2. **Worst-case degeneration to a single TCP**: several heavy flows happening to bind to the same carrier TCP → effectively a single-TCP VMUX, losing the multi-link advantage entirely (the common failure of mainstream proxy VMUX schemes).
+3. **Flow state is unpredictable; there is a race window**: A sends first, B sends later, yet B may arrive first on a real network. Pinning/reordering by send order only manufactures needless waiting. Migrating a link takes ≥2 RTT and congestion is dynamic, so prediction is unreliable.
+4. **The right approach is competition**: let multiple TCP links **compete** for the current send opportunity (whoever is free sends). Load and speed are then adaptive and controllable, with no single link's backpressure dragging the whole system. This is exactly what earlier VMUX did, and it is the most efficient.
+5. **TCP-over-TCP is an inherent flow-control limitation**: not solvable at the VMUX scheduling layer, nor by switching to QUIC; scheduling tricks are the wrong direction.
+
+### Corrected design
+
+- **Keep competition as the send-side policy for all modes**; remove per-connection binding (affinity).
+- **Decouple "binding" from "per-flow ordering"**: the maintainer objected to *binding*, not *receiver-side per-flow ordering*. They are separable — competition on send (full, adaptive, no binding) + per-flow DSN reordering on receive (isolating head-of-line blocking to a single connection). Combined, this satisfies the competition model AND removes cross-flow HoL. That is the corrected `balance`.
+- **Mode redefinition** (commit `aa3bbdc`):
+  - `compat` = original upstream (competition + global ordering).
+  - `flow` = latency-oriented new direction (competition + global ordering + optional turbo).
+  - `balance` = competition send + per-flow ordering (former flow_v2, binding removed).
+  - `stripe` = experimental per-packet round-robin + per-flow ordering.
+- **Removed config `mux.flow-v2`**; per-flow ordering is auto-negotiated by `mode∈{balance,stripe}`.
+- **Added `mux.turbo` / `--mux-mode-turbo`**: flow's latency optimization (best-link-first first packet + prewarm carriers to widen the **competition pool**, not bind/migrate).
+
+### turbo design boundaries (important)
+
+turbo must **conform to the competition model** and must not reintroduce the anti-pattern:
+
+- **Best-link-first first packet**: a new connection's first packet is sent over the currently best-quality carrier link (by heartbeat signal) only to cut first-byte latency; it does **not** pin the connection to that link — later frames return to the competition pool. Only "forward" quality (current/historical heartbeat) is used; no backward prediction.
+- **Prewarm carriers**: asynchronously open additional carrier TCP in the background; once ready they **join the competition pool** (more links to compete), with **no** connection migration (migration needs ≥2 RTT and is unreliable).
+- Goal: latency first, throughput second (75–95%). No connection splitting (cannot avoid the race).
+
+---
+
 ## Defect ledger
 
 Severity: 🔴 blocking / 🟠 high / 🟡 low-med / ✅ closed.
