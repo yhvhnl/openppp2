@@ -609,14 +609,7 @@ namespace ppp {
                 }
             }
 
-            /** @brief Forwards ICMP packet to non-gateway destination through exchanger.
-             *
-             *  Fallback strategy: when static echo is available, try it first for the
-             *  low-latency path.  Regardless of the static-echo result, also send via
-             *  the standard PacketAction_ECHO channel so the server's ICMP echo-reply
-             *  machinery always gets a chance to respond.  The server de-duplicates
-             *  repeated echo requests natively, so the extra probe is harmless.
-             */
+            /** @brief Forwards ICMP packet to non-gateway destination through exchanger. */
             bool VEthernetNetworkSwitcher::EchoOtherServer(const std::shared_ptr<VEthernetExchanger>& exchanger, const std::shared_ptr<IPFrame>& packet, const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator) noexcept {
                 if (NULLPTR == exchanger) {
                     return false;
@@ -642,6 +635,9 @@ namespace ppp {
                     __android_log_print(ANDROID_LOG_INFO, "openppp2", "icmp_other static_echo dst=%s ok=%d",
                         Ipep::ToAddress(packet->Destination).to_string().c_str(), (int)se_ok);
 #endif
+                    if (se_ok) {
+                        return true;
+                    }
                 }
 
                 bool ok = exchanger->Echo(messages->Buffer.get(), messages->Length);
