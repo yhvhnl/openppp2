@@ -239,6 +239,7 @@ namespace vmux {
             skts_.clear();
 
             tx_queue_.clear();
+            tx_ctrl_queue_.clear();
             rx_queue_.clear();
             rx_links_.clear();
             tx_links_.clear();
@@ -1192,6 +1193,7 @@ namespace vmux {
         }
 
         vmux_hdr* h = (vmux_hdr*)packet.get();
+        bool prioritize_ctrl = false;
         if (ordering_mode_ == ordering_flow_v2) {
             // flow v2: per-flow data frames carry a per-connection DSN; control
             // frames carry seq=0 (the receiver ignores their DSN). This keeps the
@@ -1210,10 +1212,22 @@ namespace vmux {
             }
             else {
                 h->seq = htonl(0);
+                // Control frames (syn/syn_ok/acceleration/keep_alived/mux_mode_set)
+                // are not DSN-gated at the receiver, so under flow v2 they take the
+                // high-priority queue and are never starved by a data backlog.
+                prioritize_ctrl = is_session_control(cmd) || is_connection_control(cmd);
             }
         }
         else {
             h->seq = htonl(status_.tx_seq_++);
+        }
+
+        if (prioritize_ctrl) {
+            // Control frames bypass acceleration and jump the data backlog. The
+            // optional completion is fired immediately (the frame is queued for a
+            // priority drain that runs at the top of process_tx_all_packets).
+            tx_ctrl_queue_.emplace_back(tx_packet{ packet, packet_length, posted_ac });
+            return process_tx_all_packets();
         }
 
         if (acceleration && base_.acceleration_) {
@@ -1592,8 +1606,44 @@ namespace vmux {
         }
     }
 
+    /** @brief Drains the high-priority control-frame queue (flow v2). */
+    bool vmux_net::process_tx_ctrl_packets() noexcept {
+        // Control frames are link-agnostic under flow v2 (seq=0, delivered inline by
+        // the receiver), so send each on any link that currently has credit. This
+        // runs before the data drain so SYN / heartbeats are never starved.
+        while (!tx_ctrl_queue_.empty()) {
+            if (tx_links_.empty()) {
+                return true; // no credit right now; a completion will re-drive us.
+            }
+
+            vmux_linklayer_list::iterator link_tail = tx_links_.begin();
+            vmux_linklayer_ptr linklayer = *link_tail;
+            tx_links_.erase(link_tail);
+
+            tx_packet_ssqueue::iterator packet_tail = tx_ctrl_queue_.begin();
+            tx_packet nexting_packet = *packet_tail;
+            tx_ctrl_queue_.erase(packet_tail);
+
+            if (!underlyin_sent(linklayer, nexting_packet.buffer, nexting_packet.length, nexting_packet.ac)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     /** @brief Drains queued packets according to selected scheduler mode. */
     bool vmux_net::process_tx_all_packets() noexcept {
+        // Always flush the high-priority control queue first (flow v2 only; empty
+        // under compat). Keeps new-connection setup and heartbeats alive even when
+        // the data queue is backlogged.
+        if (!tx_ctrl_queue_.empty()) {
+            if (!process_tx_ctrl_packets()) {
+                return false;
+            }
+        }
+
         switch (mode_) {
         case mux_mode_flow:
             return process_tx_flow_packets();

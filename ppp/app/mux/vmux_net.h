@@ -447,6 +447,15 @@ namespace vmux {
 
         /** @brief Drain queued transmit packets using the legacy scheduler. */
         bool                                                                        process_tx_compat_packets() noexcept;
+        /** @brief Drain the high-priority control-frame queue first (flow v2).
+         *  @return false on a hard send failure, true otherwise.
+         *  @details Control frames (syn/syn_ok/acceleration/keep_alived/mux_mode_set)
+         *           carry seq=0 under flow v2 and are delivered inline by the
+         *           receiver (not DSN-gated), so they may be sent ahead of data on
+         *           any free link. This keeps new-connection setup and heartbeats
+         *           alive even when tx_queue_ is backlogged. No-op under compat,
+         *           where global ordering forbids reordering control ahead of data. */
+        bool                                                                        process_tx_ctrl_packets() noexcept;
         /** @brief Drain queued transmit packets through one primary link. */
         bool                                                                        process_tx_flow_packets() noexcept;
         /** @brief Drain queued transmit packets with per-connection sticky link selection.
@@ -529,7 +538,8 @@ namespace vmux {
         StrandPtr                                                                   strand_;            ///< Serialized strand for vmux event loop.
         ContextPtr                                                                  context_;           ///< ASIO execution context.
 
-        tx_packet_ssqueue                                                           tx_queue_;          ///< Pending outbound packet queue.
+        tx_packet_ssqueue                                                           tx_queue_;          ///< Pending outbound data packet queue.
+        tx_packet_ssqueue                                                           tx_ctrl_queue_;     ///< High-priority control-frame queue (flow v2 only); drained before tx_queue_ so new-connection SYN / heartbeats are never starved by a data backlog.
         rx_packet_ssqueue                                                           rx_queue_;          ///< Out-of-order inbound packet reorder queue.
 
         mux_mode                                                                    mode_               = mux_mode_compat; ///< Transmit scheduler policy.
