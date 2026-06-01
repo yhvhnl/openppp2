@@ -54,6 +54,8 @@ namespace vmux {
             std::shared_ptr<
                 ppp::app::server::VirtualEthernetNetworkTcpipConnection>            server;
             uint64_t                                                                last_active_ = 0; ///< Tick of the most recent inbound frame on this link; turbo's approximate "best link" signal (recency, NOT RTT). Strand-affine.
+            int                                                                     inflight_ = 0;    ///< In-flight async writes issued on this link and not yet completed. Strand-affine. Used by runtime link removal (turbo dynamic pool): a link is only retired once inflight_ reaches 0 so a late write completion never touches a retired link's scheduling state.
+            bool                                                                    retiring_ = false; ///< Set when this link is being drained for runtime removal; it stops receiving new frames and is removed once inflight_ hits 0. Strand-affine.
         }                                                                           vmux_linklayer;
 
         typedef std::shared_ptr<vmux_linklayer>                                     vmux_linklayer_ptr;

@@ -403,8 +403,19 @@ namespace vmux {
 
         std::shared_ptr<vmux_net> self = shared_from_this();
         ppp::telemetry::Count("mux.link.send", 1);
+        // Track in-flight writes per link (strand-affine) so runtime link removal
+        // (turbo dynamic pool) can retire a link only after its last write
+        // completes — a late completion must never touch a freed/retired link's
+        // scheduling state.
+        linklayer->inflight_++;
         return transmission_write(self, transmission, packet, packet_length, 
             [self, this, linklayer, posted_ac](bool ok) noexcept {
+                // Decrement in-flight first; this completion is accounted regardless
+                // of what follows. Runtime removal checks inflight_ == 0 to retire.
+                if (linklayer->inflight_ > 0) {
+                    linklayer->inflight_--;
+                }
+
                 if (NULLPTR != posted_ac) {
                     posted_ac(ok);
                 }
@@ -416,6 +427,15 @@ namespace vmux {
                 // race the teardown and operate on freed list nodes. Once disposed,
                 // drop the completion: there is nothing left to schedule.
                 if (base_.disposed_.load(std::memory_order_acquire)) {
+                    return;
+                }
+
+                // A link being retired for runtime removal stops taking new frames;
+                // do not re-credit it. Once its in-flight drains to 0 the periodic
+                // maintenance path removes it. Re-drive the scheduler so queued
+                // frames continue on the remaining links.
+                if (linklayer->retiring_) {
+                    process_tx_all_packets();
                     return;
                 }
 
