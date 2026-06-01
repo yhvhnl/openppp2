@@ -553,6 +553,7 @@ namespace vmux {
         vmux::unordered_map<uint32_t, uint32_t>                                     tx_flow_seq_;       ///< connection_id -> next per-flow DSN to send (flow v2 only).
         size_t                                                                      flow_reorder_cap_bytes_ = 0; ///< Per-connection reorder buffer byte cap (from config).
         uint64_t                                                                    flow_reorder_timeout_   = 0; ///< Per-connection gap wait timeout in ms (from config).
+        uint64_t                                                                    tx_backlog_since_       = 0; ///< Tick the data tx queue first stayed at/over high-water (0 = not backlogged); drives the D11 stall watchdog.
 
         vmux_linklayer_vector                                                       rx_links_;          ///< All link-layer endpoints available for inbound.
         vmux_linklayer_list                                                         tx_links_;          ///< Link-layer endpoints ordered by transmit usage.

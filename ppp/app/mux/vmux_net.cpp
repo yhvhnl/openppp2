@@ -536,6 +536,30 @@ namespace vmux {
                     // permanently lost frame cannot stall that connection's delivery.
                     flow_evict_expired(now);
 
+                    // D11 stall watchdog: if the data tx queue stays at/over the
+                    // high-water mark for longer than the stall timeout, the send
+                    // side is wedged (carrier not draining; new connections starve)
+                    // and cannot self-heal. Tear the session down so it is rebuilt,
+                    // rather than hang forever serving nothing. Control frames have
+                    // their own priority queue, so this only triggers on a genuine
+                    // data-path wedge.
+                    size_t tx_depth = tx_queue_.size();
+                    if (tx_depth >= (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER) {
+                        if (tx_backlog_since_ == 0) {
+                            tx_backlog_since_ = now;
+                        }
+                        elif((now - tx_backlog_since_) >= (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT) {
+                            ppp::telemetry::Log(ppp::telemetry::Level::kInfo, "mux",
+                                "tx backlog stall watchdog: depth=%d held >= %dms, rebuilding session",
+                                (int)tx_depth, PPP_MUX_TX_BACKLOG_STALL_TIMEOUT);
+                            ppp::telemetry::Count("mux.tx.backlog.stall", 1);
+                            close_exec();
+                        }
+                    }
+                    else {
+                        tx_backlog_since_ = 0;
+                    }
+
                     ppp::telemetry::Gauge("mux.sched.mode", static_cast<int64_t>(mode_));
                     ppp::telemetry::Gauge("mux.tx.queue.depth", static_cast<int64_t>(tx_queue_.size()));
                     ppp::telemetry::Gauge("mux.rx.reorder.depth", static_cast<int64_t>(rx_queue_.size()));
