@@ -1,6 +1,6 @@
-# MUX Turbo 动态承载池设计与风险评估（方案 B：运行时动态增减）
+# MUX Turbo 动态承载池设计与实现说明
 
-> 状态：设计评审中（未实现）。本文件是 turbo "运行时按质量动态增减 per-connection 承载池" 的设计与风险清单，供拍板。配对实现前请逐条确认风险。技术术语保留英文。
+> 状态：已实现首版（flow 模式 turbo 的运行时动态承载池 + per-flow DSN 协商）。本文件记录当前实现和仍需关注的风险。技术术语保留英文。
 
 ## 需求
 
@@ -8,73 +8,57 @@
 - turbo 开启时，按链路质量**运行时动态增减**承载链路数：
   - 池大小 = `ceil(需求数 / (有效空闲 + 带载倍数)) × factor`，`factor ∈ [1..3]`；
   - **质量越差，池越大**（多开链路扩竞争池）。
-- 与方案 A（建链时一次性定池）的区别：B 要求**会话存活期间随质量变化加/减链路**。
+- 会话存活期间随质量变化加/减链路，不重建 mux 会话。
+- turbo 仍保持发送侧竞争法，不做 per-connection binding；额外叠加“最优链路首包”和 flow-v2 per-flow DSN，避免扩池后某条连接的缺口全局阻塞其它连接。
 
-## 当前架构的硬约束（为什么这是高风险）
+## 当前实现的不变量拆分
 
-`max_connections`（= `--tun-mux`）是会话**核心不变量**，运行时改它会连锁触发以下问题：
+`max_connections`（= `--tun-mux`）仍是建链基数和会话身份，不在运行时修改。turbo 动态池通过拆分状态避免触发整会话重建：
 
-1. **双端协商绑定**（`VirtualEthernetExchanger::OnMux`，server）：
-   - client 在 `DoMux(vlan, max_connections, ...)` 把 `max_connections` 发给 server；
-   - server `OnMux` 用 `mux->get_max_connections() != max_connections` 作为**整会话重建判据**：一旦不等，立即 `mux_.reset(); mux->close_exec()` **销毁整个 mux 会话并重建**。
-   - 含义：**运行时改变 max_connections，会被 server 当成"换了一个会话"而整体重建**——所有在途逻辑连接全断。这是 B 方案最致命的冲突点。
+- `max_connections`：base pool，保持不变；非 turbo 时也是硬上限。
+- `pool_hard_max`：运行时承载链路硬上限；turbo flow 模式下提升到 `base * PPP_MUX_TURBO_FACTOR_MAX`。
+- `pool_current`：turbo controller 的当前目标池大小，范围 `[max_connections, pool_hard_max]`。
+- `opened_connections`：只用于初始 base pool handshake 计数，以触发 established；runtime carrier id 改由 `allocate_linklayer_id()` 在 `[1, pool_hard_max]` 空闲槽中分配/复用。
 
-2. **建链完成判据**（`linklayer_established`）：`established_ = opened_connections >= max_connections`。运行时改 `max_connections` 会破坏 established 语义（已 established 的会话再改阈值，状态机不自洽）。
+server 端在 flow-capable mux 会话中提前抬高 `pool_hard_max`，允许 client turbo runtime grow 的新链路接入；非 turbo client 不会发送这些额外链路。
 
-3. **一次性 spawn forwarding**（`add_linklayer` 尾部）：当 `rx_links_.size() == max_connections` 时，遍历 `rx_links_` 对**每条链路** spawn forwarding 协程。运行时再 `add_linklayer` 会对**已在 forwarding 的旧链路重复 spawn** → double-forwarding（同一链路两个读协程）→ 数据竞争 / 重复交付 / 崩溃。
+flow+turbo 会通过 MUX `ordering_caps` 协商 flow-v2。协商成功后，数据帧的 `vmux_hdr.seq` 改按 `connection_id` 解释为 per-flow DSN；协商失败或旧端则安全回退全局定序。
 
-4. **teardown 竞态未收尾**（D1/D2/D3）：运行时增减链路会增加 `rx_links_`/`tx_links_` 的并发变更点，与尚未收尾的 teardown 生命周期叠加，放大堆破坏风险。
+## 已落地的实现点
 
-5. **owner 约束**：issue #5 评审明确"连接数绑定 `--tun-mux`，不引入 `mux.max-connections`"。运行时动态池实质上引入了一个**会话级可变连接数**，需要 owner 重新确认是否接受这一语义扩张。
+### C-B1 调用方：不新增 resize 控制帧
+- 当前实现没有新增 `cmd_pool_resize`。
+- grow 由本端 `turbo_controller_tick()` 产生 `turbo_pending_grow_`，client `VEthernetExchanger::MuxGrowLinklayers()` 消费该请求并新建一条 carrier TCP。
+- 新链路仍走现有 MUX / MUXON 建链握手；server 通过已提升的 `pool_hard_max` 接纳它。
+- 好处：不扩张控制帧，不改变 `max_connections`，不引入额外双端 resize 协议。
 
-## 实现 B 必须做的改造（风险逐项）
+### C-B2 会话不变量：base / hard / current
+- `max_connections` 继续表示 base，不作为 runtime 目标变化。
+- `add_linklayer` 配额使用 `pool_hard_max`。
+- established 判据仍以 base 完成建链为准；established 后的 `add_linklayer` 进入 runtime 单链路加入路径。
+- server `OnMux` 仍用 base 判断是否是同一 mux 会话，避免 runtime grow 被误判为会话重建。
 
-### C-B1 协议：新增"运行时增减链路"控制帧（高风险）
-- 不能复用 `DoMux` 改 `max_connections`（会触发 server 整会话重建，见约束 1）。
-- 需新增 wire 命令（如 `cmd_pool_resize`），让一端请求"在现有会话上 +N / -N 条承载链路"，server 同意后双端各自增减，且**不重建会话、不改 established**。
-- 风险：新控制帧 = 协议扩张 + 双端版本兼容（旧端不认 → 必须 fail-safe 忽略）；增加 double control 层（违背"控制平面尽量薄"）。
+### C-B3 运行时增链路：复用 `add_linklayer`，按 established 分支区分
+- 未 established：保持原始批量建链语义，base 全部到齐后 spawn forwarding。
+- 已 established：runtime 单链路语义，只 attach 当前这一条链路，只 spawn 一个 forwarding 协程。
+- pending runtime link 在握手完成前保留于 `rx_links_` 计入 hard quota，但不进入 `tx_links_`，不给发送 credit。
+- handshake 成功后再加入 `tx_links_` 并驱动 `process_tx_all_packets()`。
+- runtime grow 失败是 best-effort：只移除/Dispose 新链路，不拆掉已 established 的 base mux。
 
-### C-B2 会话不变量：max_connections 改为可变上界（高风险）
-- `max_connections` 从"固定建链数"拆成两个概念：`pool_hard_max`（硬上限，不变，防爆）+ `pool_current`（当前目标池大小，可变）。
-- `established_` 判据、`add_linklayer` 配额、server `OnMux` 重建判据全部要改为基于 `pool_hard_max` 而非当前值。
-- 风险：动 established 状态机，回归面大；改错会导致建链永不完成或提前完成。
+### C-B4 运行时减链路：retiring + inflight drain
+- `retire_linklayer_runtime()` 标记一条额外 link 为 `retiring_`。
+- retiring link 不再接收新发送；已有 async write 通过 per-link `inflight_` 计数等待完成。
+- `reap_retired_linklayers()` 只在 `inflight_ == 0` 后从 `rx_links_` / `tx_links_` / `primary_linklayer_` / `affinity_links_` 移除并 Dispose。
+- 不会退到 base 以下。
 
-### C-B3 运行时增链路：独立的单链路加入路径（高风险）
-- 必须新增一条"运行时只加 1 条链路、只 spawn 1 个 forwarding 协程"的路径，**绝不复用** `add_linklayer` 尾部的"遍历全部 spawn"逻辑（否则 double-forwarding）。
-- 新链路要走完整 handshake（client 端 `ConnectTransmission` + `ConnectMux`），在 vmux strand 上原子加入 `rx_links_`/`tx_links_`。
-- 风险：这正是 teardown 竞态的高发区；新链路加入与 finalize/drain 并发，需要 C2/C3（strand-only finalize + inflight/epoch）作为前置，否则堆破坏概率上升。
+### C-B5 质量度量与池大小控制器
+- 当前质量 proxy 使用 `tx_queue_` backlog 相对 high-water 的比例：队列越深，目标 factor 越高。
+- `factor ∈ [1, PPP_MUX_TURBO_FACTOR_MAX]`，目标池大小 clamp 到 `[base, pool_hard_max]`。
+- 控制器每个 cooldown 窗口最多 grow 或 shrink 一步，避免抖动。
+- grow 通过 `turbo_pending_grow_` 交给 exchanger；shrink 本地 retire 一条额外 link。
 
-### C-B4 运行时减链路：优雅移除（高风险）
-- 减链路要等该链路上**在途发送 completion 全部回来**（否则 completion 踩已移除链路）→ 需要 per-link inflight 计数（C3 的子集）。
-- 该链路上承载的逻辑连接帧要平滑迁移到竞争池其它链路——但竞争法本就不绑定，所以"减链路"只需停止在该链路发新帧 + 等 inflight 清零 + 关闭。
-- 风险：依赖 C3；无 inflight 计数则无法安全减链路。
+## 仍需关注的风险
 
-### C-B5 质量度量与池大小控制器（中风险）
-- 需要 per-link 或会话级质量信号驱动 `factor`。现有信号：建链耗时、stall 看门狗触发、心跳活跃度（`last_active_`）——都是近似、滞后信号（云韵已指出滞后性问题）。
-- 控制器要有**滞回/阻尼**（避免质量抖动导致池频繁增减 → 颠簸）；增减各有冷却时间。
-- 风险：中。控制器设计不当会因滞后信号 + 频繁增减放大不稳定（恰是云韵警告的"流速度起搏压垮整体"）。
-
-## 依赖关系
-
-```
-C-B3 / C-B4（运行时增/减链路）  ──依赖──>  C2（strand-only finalize）+ C3（inflight/epoch）
-C-B1（协议帧）+ C-B2（不变量拆分）         ──需要──>  双端同时升级 + owner 确认连接数语义扩张
-```
-
-**结论：B 方案的安全前提是先完成 C2/C3（teardown 生命周期加固）。** 而 C2/C3 目前因缺 ASan 栈 + 容器竞态静态不成立而搁置。在 C2/C3 未落地时实现 B，等于在已知的生命周期薄弱区上叠加更多运行时并发变更——堆破坏风险显著上升。
-
-## 建议的分期（若坚持 B）
-
-1. **前置**：先做 C2（strand-only finalize）+ C3（per-link inflight 计数）。这两项是 C-B3/C-B4 安全的硬前提。
-2. **协议**：C-B1（`cmd_pool_resize`，长度容忍、fail-safe、双端协商）。
-3. **不变量**：C-B2（`pool_hard_max` / `pool_current` 拆分，改 established / OnMux 重建判据）。
-4. **增减**：C-B3（运行时加单链路，独立 spawn）+ C-B4（运行时减链路，等 inflight 清零）。
-5. **控制器**：C-B5（带滞回的质量→池大小控制器）。
-6. 全程 ASan 构建验证，双端升级，owner 确认连接数语义。
-
-## 与方案 A 的取舍（再次澄清）
-
-- **A（建链时按质量一次性定池）**：拿到"质量差→多开链路"的核心收益，复用现有安全建链路径，零协议改动、零运行时并发新增、不依赖 C2/C3。风险接近零。
-- **B（运行时动态增减）**：完整满足"存活期动态调整"，但需要协议扩张 + 不变量重构 + C2/C3 前置 + 控制器，且与 owner 约束冲突。风险高，工期长。
-
-**工程建议仍是先做 A 验证收益，B 作为 A 之后、C2/C3 落地之后的演进。** 但方向由你定；本文件记录 B 的完整代价，便于知情决策。
+- runtime carrier id 已不再通过 `opened_connections` 单调递增分配，避免长时间 grow/shrink 后 `uint16_t` wrap 到 0；仍需在压力测试中覆盖 id 复用路径。
+- controller 使用 backlog 作为滞后质量信号，能反映压力但不是 RTT/丢包测量；可能需要后续引入更细粒度的 per-link 质量指标。
+- teardown 生命周期仍是 VMUX 的高风险区；当前通过 `retiring_` + `inflight_` 降低 runtime shrink 风险，但全链路 C2/C3 生命周期模型仍需继续推进。

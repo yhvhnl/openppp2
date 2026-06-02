@@ -380,14 +380,15 @@ namespace ppp {
                 bool err = true;
 
                 // Negotiated receiver ordering mode (flow v2). agreed == FLOW_V2 only when the
-                // peer advertised the capability AND this end's active scheduler mode needs it
-                // (balance/stripe). Anything else (older peer, caps bit clear, compat/flow mode)
-                // falls back to compat global ordering.
+                // peer advertised the capability AND this end's active scheduler configuration
+                // needs it (balance/stripe, or flow+turbo). Anything else (older peer, caps bit
+                // clear, compat/plain-flow mode) falls back to compat global ordering.
                 std::shared_ptr<ppp::configurations::AppConfiguration> configuration = switcher_->GetConfiguration();
                 vmux::vmux_net::mux_mode effective_mux_mode = NULLPTR != configuration
                     ? vmux::vmux_net::parse_mode(configuration->GetEffectiveMuxMode())
                     : vmux::vmux_net::mux_mode_compat;
-                bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(effective_mux_mode);
+                bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                    effective_mux_mode, NULLPTR != configuration && configuration->mux.turbo);
                 bool peer_supports_flow_v2 = (ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0;
                 vmux::vmux_net::receiver_ordering_mode agreed =
                     (local_supports_flow_v2 && peer_supports_flow_v2)

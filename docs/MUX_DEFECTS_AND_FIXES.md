@@ -59,8 +59,8 @@ turbo must **conform to the competition model** and must not reintroduce the ant
 
 ### turbo implementation status
 
-- **Best-link-first first packet — implemented** (commit pending): `vmux_linklayer.last_active_` is stamped in `linklayer_update()` on every inbound frame; `select_turbo_linklayer()` picks the most-recently-active live link; `post_internal` routes a `cmd_syn` over it when `mux.turbo` is on and flow mode is active, **without binding** (later frames compete normally). The signal is recency, not RTT — deliberately approximate, zero extra control frames. Fail-open to competition when no free turbo link exists.
-- **Background carrier prewarming — deferred**: requires runtime dynamic `add_linklayer`, which intersects the unfinished teardown lifecycle (D1/D2/D3). Will be implemented after the lifecycle hardening (C2/C3) lands.
+- **Best-link-first first packet — implemented**: `vmux_linklayer.last_active_` is stamped in `linklayer_update()` on every inbound frame; `select_turbo_linklayer()` picks the most-recently-active live link; `post_internal` routes a `cmd_syn` over it when `mux.turbo` is on and flow mode is active, **without binding** (later frames compete normally). The signal is recency, not RTT — deliberately approximate, zero extra control frames. Fail-open to competition when no free turbo link exists.
+- **Background carrier prewarming — implemented**: turbo splits base / hard / current pool state, raises a hard carrier ceiling for flow-mode sessions, and lets the runtime controller grow or retire one carrier link per cooldown window. Extra links join the same competition pool; shrink uses per-link `retiring_` + `inflight_` drain before Dispose. No resize control frame is added and `max_connections` remains the base session invariant.
 
 ---
 
@@ -81,10 +81,10 @@ Severity: 🔴 blocking / 🟠 high / 🟡 low-med / ✅ closed.
 
 - `forwarding` reads on the connection strand; `ITcpipTransmission::Dispose` posts `Finalize` (socket close) to the same strand (that pair is safe). But the per-read `base94_decode`/`make_shared_alloc` allocations plus the Asio async_read completion stack point to "completion touches freed object". Whether D2/D3 fixes land in vmux_net or the transmission layer must follow the ASan stack.
 
-### D4 — flow_v2 reuses balance's busy-fallback, breaking "same connection, same link" 🟠 confirmed (static review)
+### D4 — flow_v2 strict-affinity direction was removed ✅ superseded by competition send
 
-- `process_tx_flow_packets` delegates to `process_tx_balance_packets` under flow_v2; that falls back to any free link when the affinity link is busy. Its comment "correctness preserved by the global sequence number" is a **compat assumption** — flow_v2 has no global sequence.
-- Consequence: DSN=N and N+1 of one connection take links with different RTTs → receiver DSN gap → buffered in `flow_reorder_` → released only on arrival or the 2000ms timeout. Most likely under load, re-introducing the stall from the send side.
+- The earlier suspected defect assumed flow-v2 required "same connection, same link" affinity. Maintainer review rejected binding as a negative optimization.
+- Current `balance` intentionally uses the same competition send policy as `compat`; flow-v2 only changes receiver-side ordering to per-flow DSN. Cross-link DSN reordering within one connection is accepted and bounded by the per-flow reorder buffer/timeout.
 
 ### D5 — DSN monotonicity ✅ reviewed, no defect (exclusion)
 
@@ -137,15 +137,10 @@ Severity: 🔴 blocking / 🟠 high / 🟡 low-med / ✅ closed.
 **A3 RX-stall self-healing**
 - Verify `flow_evict_expired` advances in both "RX coroutine running but one flow stuck" and "RX coroutine stalled entirely"; if needed add a watchdog: when `recv` is flat for a long time while `tx_queue_` stays high, proactively downgrade the session (close_exec → rebuild) rather than hang forever.
 
-### Phase B: scheduling correctness (fixes D4 + D8)
+### Phase B: receiver-ordering tuning (fixes D8)
 
-**B1 flow_v2 strict affinity (no busy-fallback)**
-- Under flow_v2, when the affinity link is busy, **keep the frame queued until that link's completion re-drives the drain**; never cross-link fallback.
-- Implementation: add `strict_affinity` to `process_tx_balance_packets` (when `ordering_mode_==flow_v2`), or a separate flow_v2 drain.
-- Cost: a slow link only throttles the connections bound to it (the point of per-flow isolation), no longer polluting other connections' ordering.
-
-**B2 lower the reorder-timeout default**
-- Drop the default `flow.reorder.timeout` from 2000ms toward RTT scale (suggest 300–500ms, still configurable) to shorten stuck→self-heal. With B1 in place, reordering should drop sharply; this is a backstop.
+**B1 lower the reorder-timeout default**
+- Drop the default `flow.reorder.timeout` from 2000ms toward RTT scale (suggest 300–500ms, still configurable) to shorten stuck→self-heal when a per-flow DSN gap is skipped.
 
 ### Phase C: lifecycle-model correction (fixes D1/D2/D3, pending ASan stack)
 
@@ -177,8 +172,8 @@ Severity: 🔴 blocking / 🟠 high / 🟡 low-med / ✅ closed.
 |--------|----------|-------|------------|
 | D11 unbounded tx / control starvation | 🔴 | A1/A2/A3 | none (evidence ready, do now) |
 | D1/D2/D3 crash | 🔴 | C2/C3 | **ASan stack** |
-| D4 cross-link reordering | 🟠 | B1 | direction confirmation |
-| D8 timeout too large | 🟡 | B2 | with B1 |
+| D4 strict affinity | ✅ | superseded | competition-send direction |
+| D8 timeout too large | 🟡 | B1 | independent tuning |
 | D6 acceleration backpressure | 🟠 | D-opt1 | scheduled |
 | D7/D9 compatibility | 🟡 | documented | — |
 | D5/D10 | ✅ | closed | — |

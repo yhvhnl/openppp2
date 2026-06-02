@@ -855,10 +855,12 @@ namespace ppp {
                             if (!disposed_.load(std::memory_order_acquire)) {
                                 uint16_t max_connections = mux->get_max_connections();
                                 // Advertise per-flow (flow v2) receiver ordering when the active
-                                // scheduler mode needs it (balance/stripe). The server echoes the
-                                // agreed result in its MUX reply (see OnMux); negotiation is an
-                                // intersection, so an older peer transparently falls back to compat.
-                                bool advertise_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(mux->get_mode());
+                                // scheduler configuration needs it (balance/stripe, or flow+turbo).
+                                // The server echoes the agreed result in its MUX reply (see OnMux);
+                                // negotiation is an intersection, so an older peer transparently
+                                // falls back to compat.
+                                bool advertise_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                                    mux->get_mode(), NULLPTR != configuration && configuration->mux.turbo);
                                 Byte ordering_caps = advertise_flow_v2
                                     ? (Byte)vmux::vmux_net::ordering_caps_flow_v2 : (Byte)0;
                                 ok = DoMux(vnet_transmission, mux->Vlan, max_connections, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_REMOTE) != 0, ordering_caps, y);
@@ -1192,9 +1194,11 @@ namespace ppp {
                             // Apply the negotiated receiver ordering mode (flow v2) before linking.
                             // The server echoes the agreed capability in its MUX reply; agreed
                             // FLOW_V2 requires this end to also need it — i.e. an active scheduler
-                            // mode that uses per-flow ordering (balance/stripe). Fail-safe: any
-                            // mismatch or older peer falls back to compat global ordering.
-                            bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(mux->get_mode());
+                            // configuration that uses per-flow ordering (balance/stripe, or
+                            // flow+turbo). Fail-safe: any mismatch or older peer falls back to
+                            // compat global ordering.
+                            bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                                mux->get_mode(), NULLPTR != configuration && configuration->mux.turbo);
                             bool agreed_flow_v2 = local_supports_flow_v2 && ((ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0);
                             mux->set_ordering_mode(agreed_flow_v2 ? vmux::vmux_net::ordering_flow_v2 : vmux::vmux_net::ordering_compat);
 

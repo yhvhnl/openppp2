@@ -404,8 +404,8 @@ key.kf / key.kh / key.kl / key.kx / key.sb —— 非法值时重置为框架内
 |------|------|------|
 | `connect.timeout` | int | MUX 子连接建立超时（秒） |
 | `inactive.timeout` | int | MUX 空闲超时（秒） |
-| `mode` | string | 调度模式（`compat`/`flow`/`balance`/`stripe`）。所有模式发送侧均为竞争法（任意空闲链路取走下一帧，无按连接绑定）。`compat` 为上游原版（全局定序）；`flow` 时延导向（全局定序，配合 `mux.turbo`）；`balance` 增加可协商的接收端按流定序（flow v2），使连接只队头阻塞自己；`stripe` 实验性。无法识别的值归一化为 `compat` 并打印非致命启动告警 |
-| `turbo` | bool | flow 模式 turbo（默认 false）：最优链路发首包 + 预热承载链路扩大竞争池；仅在 `mux.mode=flow` 下有意义。命令行：`--mux-mode-turbo=[yes|no]` |
+| `mode` | string | 调度模式（`compat`/`flow`/`balance`/`stripe`）。`compat`/`flow`/`balance` 发送侧为竞争法（任意空闲链路取走下一帧，无按连接绑定）；`stripe` 优先逐包轮询，目标链路忙时回退到竞争池。`compat` 为上游原版（全局定序）；`flow` 时延导向（默认全局定序，配合 `mux.turbo` 时协商 per-flow DSN）；`balance` 增加可协商的接收端按流定序（flow v2），使连接只队头阻塞自己；`stripe` 实验性。无法识别的值归一化为 `compat` 并打印非致命启动告警 |
+| `turbo` | bool | flow 模式 turbo（默认 false）：最优链路发首包 + 预热承载链路扩大竞争池；双方支持 flow v2 时叠加 per-flow DSN。仅在 `mux.mode=flow` 下有意义。命令行：`--mux-mode-turbo=[yes|no]` |
 | `flow.reorder.bytes` | int | flow v2 下每连接重排缓冲字节上界（严格 > 0，默认 1048576）。约束接收端内存：某连接缓冲的乱序字节将超过该上界时跳过最老缺口（丢失字节由被隧道的 TCP 重传补偿） |
 | `flow.reorder.timeout` | int | flow v2 下每连接缺口等待超时（毫秒，严格 > 0，默认 400，贴近链路 RTT）。缺口帧在该窗口内未到达则跳过，避免交付停滞 |
 | `tx.queue.max` | int | 数据发送队列高水位深度（帧数，严格 > 0，默认 4096）。达到/超过时 acceleration 读取泵被节流（重新耦合到发送完成），避免承载停滞时队列无界增长。控制帧（SYN/心跳）走独立优先队列，不受节流影响 |

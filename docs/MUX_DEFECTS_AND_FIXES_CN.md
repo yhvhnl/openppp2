@@ -60,7 +60,7 @@ turbo 必须**符合竞争法**，不得违背上述修正：
 ### turbo 实现状态
 
 - **最优链路首包 —— 已实现**：`vmux_linklayer.last_active_` 在 `linklayer_update()` 中于每个入站帧刷新；`select_turbo_linklayer()` 选最近最活跃的存活链路；`post_internal` 在 `mux.turbo` 开启且 flow 模式下把 `cmd_syn` 路由到该链路，**不绑定**（后续帧正常竞争）。信号是“最近活跃度”而非 RTT —— 刻意近似、零新增控制帧。无空闲 turbo 链路时 fail-open 回竞争法。
-- **后台承载预热 —— 推迟**：需要运行时动态 `add_linklayer`，与尚未收尾的 teardown 生命周期（D1/D2/D3）交叠。待生命周期加固（C2/C3）落地后实现。
+- **后台承载预热 —— 已实现**：turbo 拆分 base / hard / current 池状态，在 flow-mode 会话中提高承载硬上限，并由运行时 controller 每个 cooldown 窗口 grow 或 retire 一条承载链路。额外链路加入同一个竞争池；shrink 用 per-link `retiring_` + `inflight_` drain 后再 Dispose。不新增 resize 控制帧，`max_connections` 仍是 base 会话不变量。
 
 ---
 
@@ -84,10 +84,10 @@ turbo 必须**符合竞争法**，不得违背上述修正：
 - `forwarding` 在 connection strand 上 `Read`；`ITcpipTransmission::Dispose` 将 `Finalize`（关 socket）post 到同一 strand（这一对安全）。但 `base94_decode`/`make_shared_alloc` 的 per-read 分配 + Asio async_read completion 真实栈指向“completion 提前踩已释放对象”。
 - 决定 D2/D3 修复落在 vmux_net 层还是 transmission 层，必须以 ASan 栈为准。
 
-### D4 — flow_v2 复用 balance 的 busy-fallback，破坏“同连接同链路” 🟠 已确认（静态核对）
+### D4 — flow_v2 严格 affinity 方向已移除 ✅ 被竞争法取代
 
-- `process_tx_flow_packets` 在 flow_v2 下委托 `process_tx_balance_packets`；后者在 affinity 链路 busy 时 fallback 到任意空闲链路，注释“correctness preserved by the global sequence number”是 **compat 假设**，flow_v2 无全局序号。
-- 后果：同连接 DSN=N 与 N+1 走不同 RTT 链路 → 接收端 DSN 空洞 → 进 `flow_reorder_` → 等到达或 2000ms 超时才交付。高负载时最易触发，把卡顿从发送侧重新引入。
+- 早期疑似缺陷建立在“flow-v2 需要同连接同链路 affinity”这个前提上。原作者评审后明确反对绑定，认为这是负优化。
+- 当前 `balance` 有意使用与 `compat` 相同的竞争法发送；flow-v2 只把接收侧定序改为 per-flow DSN。同连接跨链路乱序是可接受行为，由 per-flow reorder 缓冲和 timeout 有界处理。
 
 ### D5 — DSN 单调性 ✅ 已核对无缺陷（排除项）
 
@@ -140,15 +140,10 @@ turbo 必须**符合竞争法**，不得违背上述修正：
 **A3 接收停滞自愈强化**
 - 复核 `flow_evict_expired` 在“接收协程仍在跑但某 flow 卡住”与“接收协程整体停滞”两种情形下都能推进；必要时引入独立看门狗：当 `recv` 长时间不增长而 `tx_queue_` 持续高位时，主动降级该会话（close_exec 重建）而非永久挂死。
 
-### 阶段 B：调度正确性（修 D4 + D8）
+### 阶段 B：接收定序调优（修 D8）
 
-**B1 flow_v2 严格 affinity（禁 busy-fallback）**
-- flow_v2 下，affinity 链路 busy 时**把帧留在队列等待该链路 completion 再 drive**，绝不跨链路 fallback。
-- 实现：给 `process_tx_balance_packets` 增加 `strict_affinity`（当 `ordering_mode_==flow_v2`），或为 flow_v2 单独 drain。
-- 代价：慢链路只拖累绑定其上的连接（per-flow 隔离本意），不再污染其它连接的定序。
-
-**B2 reorder 超时默认下调**
-- 将默认 `flow.reorder.timeout` 从 2000ms 下调至贴近 RTT 量级（建议 300–500ms，仍可配置），缩短“卡住→自愈”时间。B1 落地后乱序应大幅减少，本项为兜底。
+**B1 reorder 超时默认下调**
+- 将默认 `flow.reorder.timeout` 从 2000ms 下调至贴近 RTT 量级（建议 300–500ms，仍可配置），缩短 per-flow DSN 缺口被跳过前的“卡住→自愈”时间。
 
 ### 阶段 C：生命周期模型修正（修 D1/D2/D3，待 ASan 栈）
 
@@ -180,13 +175,13 @@ turbo 必须**符合竞争法**，不得违背上述修正：
 |------|--------|------|------|
 | D11 tx 无界/控制帧饿死 | 🔴 | A1/A2/A3 | 无（证据齐，立即可做） |
 | D1/D2/D3 崩溃 | 🔴 | C2/C3 | **等 ASan 栈** |
-| D4 跨链路乱序 | 🟠 | B1 | 确认方向即可做 |
-| D8 超时偏大 | 🟡 | B2 | 随 B1 |
+| D4 严格 affinity | ✅ | 已被取代 | 竞争法方向 |
+| D8 超时偏大 | 🟡 | B1 | 独立调优 |
 | D6 acceleration 背压 | 🟠 | D-opt1 | 排期 |
 | D7/D9 兼容 | 🟡 | 文档已记 | — |
 | D5/D10 | ✅ | 已闭环 | — |
 
-**建议执行顺序**：A（D11 韧性，止住“不崩但全挂”）→ B（D4/D8 正确性，消除断流触发器）→ C（D1/D2/D3 崩溃，待 ASan）→ D（性能优化）。A 与 B 不依赖 ASan，可先行；C 必须等栈。
+**建议执行顺序**：A（D11 韧性，止住“不崩但全挂”）→ B（D8 接收定序调优）→ C（D1/D2/D3 崩溃，待 ASan）→ D（性能优化）。A 与 B 不依赖 ASan，可先行；C 必须等栈。
 
 ---
 

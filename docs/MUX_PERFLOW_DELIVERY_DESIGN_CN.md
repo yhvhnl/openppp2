@@ -1,10 +1,10 @@
 # MUX 按流交付设计说明（mux-perflow-delivery / flow v2）
 
-> 状态：设计 + 首版实现已落地于 `feat/mux-mode` 分支（接收端 per-flow 定序能力）。本文件是仓库内的稳定设计参考，配合 spec `.kiro/specs/mux-perflow-delivery/`（design / requirements / tasks）。技术术语保留英文。
+> 状态：设计 + 首版实现已落地（接收端 per-flow 定序能力）。本文件是仓库内的稳定设计参考，配合 spec `.kiro/specs/mux-perflow-delivery/`（design / requirements / tasks）。技术术语保留英文。
 
 ## 定位
 
-本特性是 GitHub issue #5（`--mux-mode` 调度策略）的"真正多链路聚合"阶段，即 **flow v2**：在已实现的发送侧调度器（`compat`/`flow`/`balance`/`stripe`）之上，新增**接收端按连接（per-flow）定序**这一可协商能力，消除接收端队头阻塞（HOL blocking）。
+本特性是 GitHub issue #5（`--mux-mode` 调度策略）的"真正多链路聚合"阶段，即 **flow v2**：在已实现的发送侧调度器（`compat`/`flow`/`balance`/`stripe`）之上，新增**接收端按连接（per-flow）定序**这一可协商能力，消除接收端队头阻塞（HOL blocking）。当前启用场景是 `balance`、`stripe`，以及 `flow` 开启 `mux.turbo` 时。
 
 ## 为什么需要它（根因）
 
@@ -17,7 +17,7 @@ typedef struct { uint32_t seq; uint8_t cmd; uint32_t connection_id; } vmux_hdr;
 // status_.rx_ack_  接收端严格按全局 seq 交付，乱序帧进全局 rx_queue_
 ```
 
-后果：`balance`/`stripe` 把不同连接的帧发往不同链路后，接收端仍按单一全局 `rx_ack_` 串行交付。慢链路上某个 seq 未到，全局 `rx_ack_` 停步，所有连接被一起扣押。**瓶颈在接收端的全局定序，不在发送侧分发。** 所以 `balance` 只有在 flow v2 之上才真正有用。
+后果：`balance`/`stripe` 把不同连接的帧发往不同链路后，接收端仍按单一全局 `rx_ack_` 串行交付。`flow+turbo` 还会动态预热额外承载，进一步提高跨链路乱序概率。慢链路上某个 seq 未到，全局 `rx_ack_` 停步，所有连接被一起扣押。**瓶颈在接收端的全局定序，不在发送侧分发。** 所以 `balance` 与 `flow+turbo` 只有在 flow v2 之上才真正有用。
 
 ## 核心设计
 
@@ -48,7 +48,7 @@ typedef struct {
 } VirtualEthernetLinklayer_MUX_IL;
 ```
 
-向后兼容：解析所需长度仍只覆盖**原有**字段（`sizeof(struct) - 1 - sizeof(Byte)`），`ordering_caps` 按"可选尾部"读取——旧端不发就当 0（=COMPAT）。客户端在 MUX 里声明 `bit0 = mux.flow_v2`；服务端 `OnMux` 计算 `agreed = peer_bit0 && local_flow_v2`，把 `agreed` 回显在它发回的 MUX 帧里；两端在建链前调用 `vmux_net::set_ordering_mode(agreed)`。
+向后兼容：解析所需长度仍只覆盖**原有**字段（`sizeof(struct) - 1 - sizeof(Byte)`），`ordering_caps` 按"可选尾部"读取——旧端不发就当 0（=COMPAT）。客户端在 MUX 里声明 `bit0 = mode_requires_flow_v2(mux.mode, mux.turbo)`；服务端 `OnMux` 计算 `agreed = peer_bit0 && mode_requires_flow_v2(local_mode, local_turbo)`，把 `agreed` 回显在它发回的 MUX 帧里；两端在建链前调用 `vmux_net::set_ordering_mode(agreed)`。
 
 ### 3. 序号方案：复用 `vmux_hdr.seq`，零线格式扩容
 
@@ -84,19 +84,18 @@ struct flow_rx_context {
 - 每次实际跳过递增遥测 `mux.rx.flow.evict`。
 - 第一版**无重传**：被跳过的缺口字节由被隧道的上层 TCP 重传补偿。
 
-### 6. 链路迁移不回退
+### 6. 发送侧不绑定，接收状态不回退
 
-绑定链路掉线时，沿用 `balance` 的 `select_affinity_linklayer()` 重新绑定；`flow_rx_context` 保留、`flow_rx_next_` 不回退；迁移在途丢帧表现为缺口，由超时驱逐保活。
+当前 `balance` 发送侧保持竞争法，不做 per-connection link binding；`stripe` 才是实验性逐包轮询。承载链路掉线或 runtime shrink 时，发送侧后续帧继续由剩余可用链路竞争发送。接收侧 `flow_rx_context` 保留、`flow_rx_next_` 不回退；在途丢帧表现为该连接自己的 DSN 缺口，由超时驱逐保活。
 
 ## 配置项
 
 | 键 | 类型 | 默认 | 作用 |
 |---|---|---|---|
-| `mux.flow-v2` | bool | false | 本端是否声明并允许 flow v2 接收 |
 | `mux.flow.reorder.bytes` | int (>0) | 1048576 | 每连接 reorder 缓冲字节上界 |
 | `mux.flow.reorder.timeout` | int (>0, ms) | 2000 | 缺口等待超时 |
 
-两端都设 `mux.flow-v2: true` 才会启用；任一端为 false 或旧版本则回退 compat。
+不再有独立 `mux.flow-v2` 配置项；`balance` / `stripe` 自动声明 flow v2，`compat` / `flow` 不声明。两端都处于需要 flow v2 的模式且都支持能力字节时才会启用；任一端不支持或当前模式不需要则回退 compat。
 
 ## 第一版明确不保证
 
@@ -112,6 +111,6 @@ struct flow_rx_context {
 - `ppp/app/mux/vmux_net.h` / `.cpp`：`receiver_ordering_mode`、`flow_rx_context`、`packet_input_flow`、`deliver_one`、`flow_force_advance`、`flow_evict_expired`、`maybe_release_flow`、`set_ordering_mode`、`post_internal` 的 DSN 分支、`forwarding` 分流。
 - `ppp/app/protocol/VirtualEthernetLinklayer.h` / `.cpp`：MUX_IL 追加 `ordering_caps`，`DoMux`/`OnMux` 增参与长度容忍解析。
 - `ppp/app/server/VirtualEthernetExchanger.cpp` / `ppp/app/client/VEthernetExchanger.cpp`：协商 `agreed` 并 `set_ordering_mode`。
-- `ppp/configurations/AppConfiguration.h` / `.cpp`：`mux.flow_v2` / `mux.flow.reorder.*`。
+- `ppp/configurations/AppConfiguration.h` / `.cpp`：`mux.mode` / `mux.flow.reorder.*`。
 
 详见 spec：`.kiro/specs/mux-perflow-delivery/{design,requirements,tasks}.md`。

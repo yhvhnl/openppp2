@@ -1601,20 +1601,40 @@ namespace vmux {
         return best;
     }
 
-    /**
-     * @brief Per-packet policy drain shared notes (balance/stripe).
-     * @details Unlike compat/flow which drive from the free-link list, these
-     *          modes drive from the packet queue and pick the link per packet
-     *          (affinity for balance, round-robin for stripe). A link is removed
-     *          from tx_links_ (marked busy) before the async write; the
-     *          completion in underlyin_sent re-credits the link and re-runs the
-     *          scheduler so the next frame is routed by policy again.
-     *
-     *          NOTE: this is a send-side policy only. The protocol still uses a
-     *          single global tx_seq_/rx_ack_, so the receiver delivers in global
-     *          order; balance/stripe improve link utilization but do not remove
-     *          receiver-side head-of-line blocking (see issue #5 design notes).
-     */
+    bool vmux_net::linklayer_id_in_use(uint16_t id, const vmux_linklayer_ptr& except) noexcept {
+        if (id == 0) {
+            return true;
+        }
+
+        for (const vmux_linklayer_ptr& linklayer : rx_links_) {
+            if (NULLPTR != linklayer && linklayer != except && linklayer->id_ == id) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    uint16_t vmux_net::allocate_linklayer_id(const vmux_linklayer_ptr& linklayer) noexcept {
+        if (NULLPTR == linklayer || status_.pool_hard_max == 0) {
+            return 0;
+        }
+
+        if (linklayer->id_ != 0 && linklayer->id_ <= status_.pool_hard_max && !linklayer_id_in_use(linklayer->id_, linklayer)) {
+            return linklayer->id_;
+        }
+
+        for (uint32_t id = 1; id <= status_.pool_hard_max; id++) {
+            uint16_t candidate = (uint16_t)id;
+            if (!linklayer_id_in_use(candidate, linklayer)) {
+                linklayer->id_ = candidate;
+                return candidate;
+            }
+        }
+
+        return 0;
+    }
+
     /**
      * @brief Send-side scheduling for balance mode.
      * @details balance uses the same competition policy as compat (any link with
@@ -1833,7 +1853,12 @@ namespace vmux {
 
             uint16_t connection_id = 0;
             if (base_.server_or_client_) {
-                connection_id = ++status_.opened_connections;
+                connection_id = allocate_linklayer_id(linklayer);
+                if (connection_id == 0) {
+                    remove_linklayer(linklayer);
+                    ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionQuotaExceeded);
+                    return false;
+                }
             }
 
             std::shared_ptr<vmux_net> self = shared_from_this();
@@ -1919,7 +1944,11 @@ namespace vmux {
 
             uint16_t connection_id = 0;
             if (base_.server_or_client_) {
-                connection_id = ++status_.opened_connections;
+                connection_id = allocate_linklayer_id(linklayer);
+                if (connection_id == 0) {
+                    ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::SessionQuotaExceeded);
+                    return false;
+                }
             }
 
             auto& connection = linklayer->connection;
@@ -2160,6 +2189,11 @@ namespace vmux {
 #pragma pack(pop)
 
         if (base_.server_or_client_) {
+            if (connection_id == 0 || connection_id > status_.pool_hard_max) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                return false;
+            }
+
             vmux_linlayer_add_ack_packet packet;
             packet.receive_id = htons(connection_id);
 
@@ -2187,7 +2221,19 @@ namespace vmux {
             }
 
             SynchronizationObjectScope __SCOPE__(syncobj_);
-            status_.opened_connections++;
+            if (linklayer_id_in_use((uint16_t)receive_id, linklayer)) {
+                ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
+                return false;
+            }
+
+            linklayer->id_ = (uint16_t)receive_id;
+        }
+
+        {
+            SynchronizationObjectScope __SCOPE__(syncobj_);
+            if (!base_.established_ && status_.opened_connections < status_.max_connections) {
+                status_.opened_connections++;
+            }
         }
 
         linklayer_established();

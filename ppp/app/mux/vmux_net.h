@@ -53,6 +53,7 @@ namespace vmux {
             VirtualEthernetTcpipConnectionPtr                                       connection;
             std::shared_ptr<
                 ppp::app::server::VirtualEthernetNetworkTcpipConnection>            server;
+            uint16_t                                                                id_ = 0; ///< Server-assigned carrier-link id used by MUXON handshake; 0 means unassigned. Strand-affine.
             uint64_t                                                                last_active_ = 0; ///< Tick of the most recent inbound frame on this link; turbo's approximate "best link" signal (recency, NOT RTT). Strand-affine.
             int                                                                     inflight_ = 0;    ///< In-flight async writes issued on this link and not yet completed. Strand-affine. Used by runtime link removal (turbo dynamic pool): a link is only retired once inflight_ reaches 0 so a late write completion never touches a retired link's scheduling state.
             bool                                                                    retiring_ = false; ///< Set when this link is being drained for runtime removal; it stops receiving new frames and is removed once inflight_ hits 0. Strand-affine.
@@ -283,17 +284,21 @@ namespace vmux {
             return cmd == cmd_push || cmd == cmd_fin;
         }
         /**
-         * @brief True for scheduler modes that use negotiated per-flow receiver
-         *        ordering (flow v2 / balance).
+         * @brief True when this scheduler configuration uses negotiated per-flow
+         *        receiver ordering (flow v2 / per-flow DSN).
          * @details balance spreads one session's frames across links by competition
          *          (any free link sends any frame) and relies on the receiver
          *          reordering each connection independently by per-flow DSN, so
          *          cross-link reordering is not mistaken for loss. stripe (legacy,
-         *          experimental) likewise needs per-flow reordering. compat and flow
-         *          use the single global sequence (no per-flow reordering).
+         *          experimental) likewise needs per-flow reordering. flow only needs
+         *          it when turbo is enabled, so turbo can add best-link-first and
+         *          prewarmed carriers without reintroducing cross-flow HoL blocking.
          */
+        static bool                                                                 mode_requires_flow_v2(mux_mode mode, bool turbo) noexcept {
+            return mode == mux_mode_balance || mode == mux_mode_stripe || (mode == mux_mode_flow && turbo);
+        }
         static bool                                                                 mode_requires_flow_v2(mux_mode mode) noexcept {
-            return mode == mux_mode_balance || mode == mux_mode_stripe;
+            return mode_requires_flow_v2(mode, false);
         }
         /**
          * @brief Push a debug-only mux-mode change request to the peer.
@@ -492,6 +497,10 @@ namespace vmux {
          *           new connection's first packet under turbo; the connection is NOT
          *           bound to this link (later frames return to the competition pool). */
         vmux_linklayer_ptr                                                          select_turbo_linklayer() noexcept;
+        /** @brief Return true when a carrier id is already assigned to another link. */
+        bool                                                                        linklayer_id_in_use(uint16_t id, const vmux_linklayer_ptr& except) noexcept;
+        /** @brief Allocate a non-zero carrier id in [1, pool_hard_max], reusing retired ids. */
+        uint16_t                                                                    allocate_linklayer_id(const vmux_linklayer_ptr& linklayer) noexcept;
         /** @brief Read the connection_id stored in a queued vmux frame buffer. */
         static uint32_t                                                             peek_connection_id(const std::shared_ptr<Byte>& packet, int packet_length) noexcept;
 
@@ -575,7 +584,7 @@ namespace vmux {
             uint16_t                                                                max_connections    = 0; ///< Initial/established carrier-link target (= --tun-mux base). Established fires at this count; unchanged on the wire.
             uint16_t                                                                pool_hard_max      = 0; ///< Absolute upper bound on carrier links (turbo dynamic pool). Equals max_connections when turbo is off; base*factor when on. add_linklayer quota uses this.
             uint16_t                                                                pool_current       = 0; ///< Current runtime target pool size (turbo controller), in [max_connections, pool_hard_max]. Equals max_connections when turbo off.
-            uint16_t                                                                opened_connections = 0; ///< Currently active logical connection count.
+            uint16_t                                                                opened_connections = 0; ///< Successful base-pool handshakes used to mark initial establishment; runtime carrier ids are allocated from free slots, not by incrementing this counter.
 
             uint32_t                                                                rx_ack_            = 0; ///< Last acknowledged inbound sequence number.
             uint32_t                                                                tx_seq_            = 0; ///< Next outbound sequence number to use.

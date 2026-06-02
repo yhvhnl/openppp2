@@ -265,19 +265,23 @@ Valid values depend on the build configuration.
 
 ### `--mux-mode=<compat|flow|balance|stripe>`
 
-MUX scheduler mode. All modes send by **competition** (any linklayer with send credit
-takes the next queued frame — no per-connection binding, which would risk load imbalance
-and degenerate to a single TCP under several heavy flows). Modes differ in receiver-side
-ordering and intent. None change the wire format. Configure both peers consistently.
+MUX scheduler mode. `compat` / `flow` / `balance` send by **competition** (any
+linklayer with send credit takes the next queued frame — no per-connection binding,
+which would risk load imbalance and degenerate to a single TCP under several heavy
+flows). `stripe` is the experimental exception: it prefers round-robin per-packet
+distribution, with busy-link fallback. Modes differ in receiver-side ordering and intent.
+`flow` with turbo, `balance`, and `stripe` add an optional MUX capability byte for
+flow-v2 negotiation.
+Configure both peers consistently.
 
 | Mode | Behavior | Use case |
 |------|----------|----------|
 | `compat` | Original upstream behavior: competition send + single global sequence/ack ordering on receive. One connection's gap head-of-line blocks all connections. | Default / rollback / regression baseline. |
-| `flow` | Latency-oriented direction: competition send + global ordering. Optional `--mux-mode-turbo` layers best-link-first first-packet and prewarmed carrier links on top for first-byte responsiveness, without per-connection binding. | Interactive / web / latency-sensitive use. |
+| `flow` | Latency-oriented direction: competition send + global ordering. Optional `--mux-mode-turbo` layers best-link-first first-packet, prewarmed carrier links, and negotiated per-flow DSN on top for first-byte responsiveness without cross-flow HoL blocking or per-connection binding. | Interactive / web / latency-sensitive use. |
 | `balance` | Competition send + **negotiated per-flow receiver ordering (flow v2)**: each connection is reordered independently by per-flow DSN, so a slow/blocked connection only head-of-line blocks itself, not the others — while every link stays fully and adaptively utilized (no binding). | Many concurrent connections wanting throughput with per-flow isolation. |
 | `stripe` | Experimental: round-robin per-packet distribution + per-flow ordering. | Future pseudo-MPTCP / 9000-MTU work. |
 
-> **`balance`/`stripe` negotiate per-flow ordering and need both ends on a supporting
+> **`flow+turbo`, `balance`, and `stripe` negotiate per-flow ordering and need both ends on a supporting
 > build.** Negotiation is an intersection; against an older peer the session falls back to
 > `compat` global ordering (no regression, no per-flow benefit). The trade-off of per-flow
 > ordering is that a connection's own frames may arrive out of order across links and wait
@@ -293,17 +297,19 @@ Set `mux.mode` in JSON or pass `--mux-mode=flow` at startup (CLI overrides JSON)
 
 ### `--mux-mode-turbo=[yes|no]`
 
-flow-mode turbo (opt-in, default `no`; only meaningful under `--mux-mode=flow`). Sends a
-new connection's first packet over the most-recently-active carrier link (an approximate
+flow-mode turbo (opt-in, default `no`; only meaningful under `--mux-mode=flow`). It sends
+a new connection's first packet over the most-recently-active carrier link (an approximate
 "best link" by recency of inbound traffic — **not** an RTT measurement; it reuses existing
 per-link activity and adds no control frames) to cut first-byte latency. The connection is
 **not** bound to that link — every later frame returns to the normal competition pool.
-Set `mux.turbo` in JSON or pass `--mux-mode-turbo=yes`.
 
-> Background carrier prewarming (opening extra carrier TCP to widen the competition pool)
-> is part of the turbo design but is **not yet implemented** — it depends on the mux
-> session lifecycle (teardown) hardening still in progress. Today turbo = best-link-first
-> first packet only.
+Turbo also negotiates flow-v2 per-flow DSN when both peers support it, so a delayed frame
+from one connection does not globally head-of-line block unrelated connections while the
+extra carrier pool is active. It opens and retires extra carrier TCP links at runtime to
+widen the competition pool when backlog indicates poor quality. The original `--tun-mux`
+value remains the base pool size; turbo raises only the runtime carrier ceiling and does
+not add per-connection binding or rebuild the mux session. Set `mux.turbo` in JSON or pass
+`--mux-mode-turbo=yes`.
 
 **Default:** `no`
 
