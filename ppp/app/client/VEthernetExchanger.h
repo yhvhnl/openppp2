@@ -838,6 +838,12 @@ namespace ppp {
                  * @return true if all sub-links were connected; false if any failed.
                  */
                 bool                                                                    MuxConnectAllLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux) noexcept;
+                /**
+                 * @brief Connect N extra carrier links at runtime and attach each via
+                 *        add_linklayer's established-session path (turbo dynamic pool grow).
+                 * @return true when the grow coroutine was spawned.
+                 */
+                bool                                                                    MuxGrowLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux, int count) noexcept;
 
             private:
                 /**

@@ -779,6 +779,16 @@ namespace ppp {
                         }
 
                         if (breaking) {
+                            // turbo dynamic pool: if the quality controller asked to
+                            // grow, connect that many extra carrier links at runtime
+                            // and attach each through add_linklayer's established-
+                            // session path (single-link, single forwarding coroutine).
+                            if (mux->is_established()) {
+                                int grow = mux->take_turbo_pending_grow();
+                                if (grow > 0) {
+                                    MuxGrowLinklayers(switcher_->GetBufferAllocator(), mux, grow);
+                                }
+                            }
                             break;
                         }
                     }
@@ -793,6 +803,20 @@ namespace ppp {
                         mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, false, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_LOCAL) != 0, mux_mode);
                         if (NULLPTR == mux) {
                             break;
+                        }
+
+                        // turbo dynamic pool: raise the carrier-link ceiling to
+                        // base * PPP_MUX_TURBO_FACTOR_MAX so the quality controller
+                        // can grow the pool past --tun-mux under poor quality. The
+                        // base (max_connections) is still what is established and
+                        // negotiated on the wire; growth happens at runtime.
+                        if (mux_mode == vmux::vmux_net::mux_mode_flow &&
+                            NULLPTR != configuration && configuration->mux.turbo) {
+                            uint32_t hard = (uint32_t)max_connections * (uint32_t)PPP_MUX_TURBO_FACTOR_MAX;
+                            if (hard > UINT16_MAX) {
+                                hard = UINT16_MAX;
+                            }
+                            mux->set_pool_hard_max((uint16_t)hard);
                         }
                     }
 
@@ -830,9 +854,14 @@ namespace ppp {
                             bool ok = false;
                             if (!disposed_.load(std::memory_order_acquire)) {
                                 uint16_t max_connections = mux->get_max_connections();
-                                // Advertise FLOW_V2 capability when locally enabled; the server
-                                // echoes back the agreed result in its MUX reply (see OnMux).
-                                Byte ordering_caps = (NULLPTR != configuration && configuration->mux.flow_v2)
+                                // Advertise per-flow (flow v2) receiver ordering when the active
+                                // scheduler configuration needs it (balance/stripe, or flow+turbo).
+                                // The server echoes the agreed result in its MUX reply (see OnMux);
+                                // negotiation is an intersection, so an older peer transparently
+                                // falls back to compat.
+                                bool advertise_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                                    mux->get_mode(), NULLPTR != configuration && configuration->mux.turbo);
+                                Byte ordering_caps = advertise_flow_v2
                                     ? (Byte)vmux::vmux_net::ordering_caps_flow_v2 : (Byte)0;
                                 ok = DoMux(vnet_transmission, mux->Vlan, max_connections, (switcher_->mux_acceleration_ & PPP_MUX_ACCELERATION_REMOTE) != 0, ordering_caps, y);
                             }
@@ -969,6 +998,72 @@ namespace ppp {
                     });
             }
 
+            /** @brief Connects `count` extra carrier links at runtime (turbo grow, C-B3 caller). */
+            bool VEthernetExchanger::MuxGrowLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux, int count) noexcept {
+                using ppp::app::protocol::VirtualEthernetTcpipConnection;
+
+                if (NULLPTR == mux || count <= 0) {
+                    return false;
+                }
+
+                std::shared_ptr<boost::asio::io_context> context = mux->get_context();
+                if (NULLPTR == context) {
+                    return ppp::diagnostics::SetLastError(ppp::diagnostics::ErrorCode::RuntimeIoContextMissing);
+                }
+
+                auto self = shared_from_this();
+                auto strand = mux->get_strand();
+
+                return YieldContext::Spawn(allocator.get(), *context, strand.get(),
+                    [self, this, mux, count, context, strand](YieldContext& y) noexcept -> bool {
+                        // Grow is best-effort and non-fatal: a failed extra link must
+                        // never tear down the established base pool. Stop on the first
+                        // failure and leave the existing links untouched.
+                        const uint32_t& tx_seq = mux->get_tx_seq();
+                        const uint32_t& rx_ack = mux->get_rx_ack();
+
+                        for (int i = 0; i < count; i++) {
+                            if (disposed_.load(std::memory_order_acquire) || mux != mux_ || mux->is_disposed()) {
+                                break;
+                            }
+
+                            ITransmissionPtr transmission = ConnectTransmission(context, strand, y);
+                            if (NULLPTR == transmission) {
+                                break;
+                            }
+
+                            std::shared_ptr<boost::asio::ip::tcp::socket> default_socket;
+                            std::shared_ptr<VirtualEthernetTcpipConnection> connection =
+                                make_shared_object<VirtualEthernetTcpipConnection>(
+                                    mux->AppConfiguration, context, strand, GetId(), default_socket);
+                            if (NULLPTR == connection) {
+                                break;
+                            }
+
+                            if (!connection->ConnectMux(y, transmission, mux->Vlan, rx_ack, tx_seq)) {
+                                break;
+                            }
+
+                            bool bok = mux->do_yield(y,
+                                [self, mux, connection]() noexcept -> bool {
+                                    vmux::vmux_net::vmux_linklayer_ptr linklayer;
+                                    vmux::vmux_net::vmux_native_add_linklayer_after_success_before_callback handling;
+                                    // The mux strand enforces the runtime hard ceiling.
+                                    // add_linklayer detects the established session and
+                                    // attaches this as a single runtime link (one
+                                    // forwarding coroutine; no batch re-spawn).
+                                    return mux->add_linklayer(connection, linklayer, handling);
+                                });
+
+                            if (!bok) {
+                                break;
+                            }
+                        }
+
+                        return true;
+                    });
+            }
+
             /** @brief Removes a deadline timer from tracking table and cancels it. */
             bool VEthernetExchanger::ReleaseDeadlineTimer(const boost::asio::steady_timer* deadline_timer) noexcept {
                 if (NULLPTR == deadline_timer) {
@@ -1098,8 +1193,12 @@ namespace ppp {
 
                             // Apply the negotiated receiver ordering mode (flow v2) before linking.
                             // The server echoes the agreed capability in its MUX reply; agreed
-                            // FLOW_V2 requires this end to also have it enabled (fail-safe to compat).
-                            bool local_supports_flow_v2 = NULLPTR != configuration && configuration->mux.flow_v2;
+                            // FLOW_V2 requires this end to also need it — i.e. an active scheduler
+                            // configuration that uses per-flow ordering (balance/stripe, or
+                            // flow+turbo). Fail-safe: any mismatch or older peer falls back to
+                            // compat global ordering.
+                            bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                                mux->get_mode(), NULLPTR != configuration && configuration->mux.turbo);
                             bool agreed_flow_v2 = local_supports_flow_v2 && ((ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0);
                             mux->set_ordering_mode(agreed_flow_v2 ? vmux::vmux_net::ordering_flow_v2 : vmux::vmux_net::ordering_compat);
 

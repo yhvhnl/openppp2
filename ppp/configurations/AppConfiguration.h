@@ -134,13 +134,19 @@ namespace ppp {
                 ppp::string                                                 mode;           ///< MUX transmit scheduler mode: compat or flow.
                 int                                                         congestions;    ///< MUX congestion control level; higher values reduce burst aggressiveness.
                 int                                                         keep_alived[2]; ///< MUX keep-alive interval range [min, max] in seconds.
-                bool                                                        flow_v2;        ///< Enable negotiated per-flow receiver ordering (flow v2); default false.
+                bool                                                        turbo;          ///< flow-mode turbo: best-link-first first packet + prewarmed carrier links (--mux-mode-turbo); default false.
                 struct {
                     struct {
                         int                                                 bytes;          ///< Per-connection reorder buffer byte cap (flow v2); strictly > 0.
                         int                                                 timeout;        ///< Per-connection gap wait timeout in milliseconds (flow v2); strictly > 0.
                     }                                                       reorder;
                 }                                                           flow;           ///< Per-flow (flow v2) receiver ordering parameters.
+                struct {
+                    struct {
+                        int                                                 max;            ///< Data tx-queue high-water depth; acceleration read-pump throttles at/above it (D11). > 0.
+                        int                                                 stall;          ///< Milliseconds the data tx-queue may stay backlogged before the session is rebuilt (D11 watchdog). > 0.
+                    }                                                       queue;
+                }                                                           tx;             ///< Transmit-side flow-control / backpressure parameters.
                 struct {
                     ppp::string                                             key;            ///< Shared debug secret (`--debug-key`); empty disables remote mux-mode control.
                     ppp::string                                             set_mode;       ///< Transient `--mux-mode-set` request; pushes a mode change to the peer once at startup.

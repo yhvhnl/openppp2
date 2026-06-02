@@ -380,10 +380,15 @@ namespace ppp {
                 bool err = true;
 
                 // Negotiated receiver ordering mode (flow v2). agreed == FLOW_V2 only when the
-                // peer advertised the capability AND this end is configured to allow it. Anything
-                // else (older peer, caps bit clear, mux.flow-v2 disabled) falls back to compat.
+                // peer advertised the capability AND this end's active scheduler configuration
+                // needs it (balance/stripe, or flow+turbo). Anything else (older peer, caps bit
+                // clear, compat/plain-flow mode) falls back to compat global ordering.
                 std::shared_ptr<ppp::configurations::AppConfiguration> configuration = switcher_->GetConfiguration();
-                bool local_supports_flow_v2 = NULLPTR != configuration && configuration->mux.flow_v2;
+                vmux::vmux_net::mux_mode effective_mux_mode = NULLPTR != configuration
+                    ? vmux::vmux_net::parse_mode(configuration->GetEffectiveMuxMode())
+                    : vmux::vmux_net::mux_mode_compat;
+                bool local_supports_flow_v2 = vmux::vmux_net::mode_requires_flow_v2(
+                    effective_mux_mode, NULLPTR != configuration && configuration->mux.turbo);
                 bool peer_supports_flow_v2 = (ordering_caps & vmux::vmux_net::ordering_caps_flow_v2) != 0;
                 vmux::vmux_net::receiver_ordering_mode agreed =
                     (local_supports_flow_v2 && peer_supports_flow_v2)
@@ -417,7 +422,7 @@ namespace ppp {
                         break;
                     }
 
-                    vmux::vmux_net::mux_mode mux_mode = NULLPTR != configuration ? vmux::vmux_net::parse_mode(configuration->GetEffectiveMuxMode()) : vmux::vmux_net::mux_mode_compat;
+                    vmux::vmux_net::mux_mode mux_mode = effective_mux_mode;
                     mux = make_shared_object<vmux::vmux_net>(vmux_context, vmux_strand, max_connections, true, acceleration, mux_mode);
                     if (NULLPTR != mux) {
                         mux->Vlan = vlan;
@@ -425,6 +430,20 @@ namespace ppp {
                         mux->Logger = switcher_->GetLogger();
                         mux->AppConfiguration = configuration;
                         mux->BufferAllocator = transmission->BufferAllocator;
+
+                        // turbo dynamic pool: the client may grow its carrier pool past
+                        // the negotiated base at runtime. The client's turbo flag is
+                        // not on the wire, so the server cannot know it; raise the
+                        // ceiling for any flow-mode session (the ceiling is only a
+                        // safety cap — accepting the extra ConnectMux links is benign,
+                        // and a non-turbo client simply never sends them).
+                        if (mux_mode == vmux::vmux_net::mux_mode_flow) {
+                            uint32_t hard = (uint32_t)max_connections * (uint32_t)PPP_MUX_TURBO_FACTOR_MAX;
+                            if (hard > UINT16_MAX) {
+                                hard = UINT16_MAX;
+                            }
+                            mux->set_pool_hard_max((uint16_t)hard);
+                        }
 
                         // Apply the negotiated ordering mode before the session is established.
                         mux->set_ordering_mode(agreed);
