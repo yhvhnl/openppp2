@@ -250,7 +250,8 @@ namespace vmux {
         /**
          * @brief Consume the turbo controller's pending "add N carrier links" request.
          * @return Number of links the exchanger should connect+ConnectMux+add now
-         *         (via add_linklayer_runtime). Resets the pending counter to 0.
+         *         through add_linklayer's established-session path. Resets the
+         *         pending counter to 0.
          * @note Strand-affine; called by the client exchanger's periodic mux pump.
          */
         int                                                                         take_turbo_pending_grow() noexcept;
@@ -525,6 +526,8 @@ namespace vmux {
 
         /** @brief Get one active underlying virtual-ethernet connection. */
         VirtualEthernetTcpipConnectionPtr                                           get_linklayer() noexcept;
+        /** @brief Remove one link-layer endpoint from scheduling tables. */
+        void                                                                        remove_linklayer(const vmux_linklayer_ptr& linklayer) noexcept;
 
         /** @brief Validate and post outgoing connect request command. */
         bool                                                                        connect_require(

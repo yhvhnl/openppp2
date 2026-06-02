@@ -324,6 +324,44 @@ namespace vmux {
         return tail != endl ? (*tail)->connection : NULLPTR;
     }
 
+    /** @brief Removes one link-layer endpoint from receive/transmit scheduling state. */
+    void vmux_net::remove_linklayer(const vmux_linklayer_ptr& linklayer) noexcept {
+        if (NULLPTR == linklayer) {
+            return;
+        }
+
+        for (vmux_linklayer_vector::iterator it = rx_links_.begin(); it != rx_links_.end();) {
+            if (*it == linklayer) {
+                it = rx_links_.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        for (vmux_linklayer_list::iterator it = tx_links_.begin(); it != tx_links_.end();) {
+            if (*it == linklayer) {
+                it = tx_links_.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+
+        if (primary_linklayer_ == linklayer) {
+            primary_linklayer_.reset();
+        }
+
+        for (auto it = affinity_links_.begin(); it != affinity_links_.end();) {
+            if (it->second == linklayer) {
+                it = affinity_links_.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+
     /**
      * @brief Performs first-time-transfer sequence initialization/validation.
      */
@@ -1776,7 +1814,19 @@ namespace vmux {
         // re-spawn forwarding on existing links = double-forwarding). The optional
         // cb (server-side DoMuxON ack) still runs.
         if (base_.established_) {
+            // Keep the pending link in rx_links_ so it counts toward the hard
+            // ceiling, but withhold send credit until its handshake completes.
+            for (vmux_linklayer_list::iterator it = tx_links_.begin(); it != tx_links_.end();) {
+                if (*it == linklayer) {
+                    it = tx_links_.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+
             if (NULLPTR != cb && !cb()) {
+                remove_linklayer(linklayer);
                 ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
                 return false;
             }
@@ -1794,23 +1844,51 @@ namespace vmux {
 
             auto process =
                 [self, this, added, connection_id, connection_context, connection_strand](ppp::coroutines::YieldContext& y) noexcept {
-                    if (handshake(added, connection_id, y)) {
-                        forwarding(added, y);
+                    bool ok = handshake(added, connection_id, y);
+                    if (ok) {
+                        ok = vmux_post_exec(context_, strand_,
+                            [self, this, added]() noexcept {
+                                if (base_.disposed_.load(std::memory_order_acquire) || added->retiring_) {
+                                    return false;
+                                }
+
+                                tx_links_.emplace_back(added);
+                                linklayer_update(added);
+                                if (!process_tx_all_packets()) {
+                                    close_exec();
+                                    return false;
+                                }
+
+                                return true;
+                            });
                     }
 
-                    // A retiring link ending is the normal removal path, not a fault.
-                    if (!added->retiring_) {
-                        close_exec();
+                    if (ok) {
+                        (void)forwarding(added, y);
                     }
+
+                    // Runtime grow links are best-effort; their setup/read failure
+                    // must not tear down the established base pool.
+                    vmux_post_exec(context_, strand_,
+                        [self, this, added]() noexcept {
+                            remove_linklayer(added);
+                            if (NULLPTR != added->connection) {
+                                added->connection->Dispose();
+                            }
+
+                            if (auto server = std::move(added->server); NULLPTR != server) {
+                                server->Dispose();
+                            }
+                            return true;
+                        });
                 };
-
             if (!ppp::coroutines::YieldContext::Spawn(BufferAllocator.get(), *connection_context, connection_strand.get(), process)) {
+                remove_linklayer(linklayer);
                 ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::RuntimeCoroutineSpawnFailed);
                 return false;
             }
 
             ppp::telemetry::Count("mux.link.open.runtime", 1);
-            linklayer_update(linklayer);
             return true;
         }
 
@@ -2101,9 +2179,9 @@ namespace vmux {
             vmux_linlayer_add_ack_packet* packet = (vmux_linlayer_add_ack_packet*)packet_memory.get();
             uint32_t receive_id = ntohs(packet->receive_id);
 
-            // receive_id is assigned by the server and may arrive out of order
-            // while the client is still adding remaining linklayers.
-            if (receive_id == 0 || receive_id > status_.max_connections) {
+            // receive_id is assigned by the server and may exceed the base pool
+            // when turbo grows carrier links at runtime.
+            if (receive_id == 0 || receive_id > status_.pool_hard_max) {
                 ppp::diagnostics::SetLastErrorCode(ppp::diagnostics::ErrorCode::ProtocolMuxFailed);
                 return false;
             }

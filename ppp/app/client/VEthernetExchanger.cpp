@@ -781,8 +781,8 @@ namespace ppp {
                         if (breaking) {
                             // turbo dynamic pool: if the quality controller asked to
                             // grow, connect that many extra carrier links at runtime
-                            // and attach each via add_linklayer_runtime (single-link,
-                            // single forwarding coroutine — never the batch path).
+                            // and attach each through add_linklayer's established-
+                            // session path (single-link, single forwarding coroutine).
                             if (mux->is_established()) {
                                 int grow = mux->take_turbo_pending_grow();
                                 if (grow > 0) {
@@ -1025,11 +1025,6 @@ namespace ppp {
                                 break;
                             }
 
-                            // Respect the runtime ceiling.
-                            if (mux->get_max_connections() == 0) {
-                                break;
-                            }
-
                             ITransmissionPtr transmission = ConnectTransmission(context, strand, y);
                             if (NULLPTR == transmission) {
                                 break;
@@ -1051,6 +1046,7 @@ namespace ppp {
                                 [self, mux, connection]() noexcept -> bool {
                                     vmux::vmux_net::vmux_linklayer_ptr linklayer;
                                     vmux::vmux_net::vmux_native_add_linklayer_after_success_before_callback handling;
+                                    // The mux strand enforces the runtime hard ceiling.
                                     // add_linklayer detects the established session and
                                     // attaches this as a single runtime link (one
                                     // forwarding coroutine; no batch re-spawn).
