@@ -49,7 +49,7 @@ namespace vmux {
         /**
          * @brief Pair of vmux protocol connection and server-side transport wrapper.
          */
-        typedef struct {
+        typedef struct vmux_linklayer {
             VirtualEthernetTcpipConnectionPtr                                       connection;
             std::shared_ptr<
                 ppp::app::server::VirtualEthernetNetworkTcpipConnection>            server;
