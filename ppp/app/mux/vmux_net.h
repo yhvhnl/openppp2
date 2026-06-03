@@ -49,10 +49,14 @@ namespace vmux {
         /**
          * @brief Pair of vmux protocol connection and server-side transport wrapper.
          */
-        typedef struct {
+        typedef struct vmux_linklayer {
             VirtualEthernetTcpipConnectionPtr                                       connection;
             std::shared_ptr<
                 ppp::app::server::VirtualEthernetNetworkTcpipConnection>            server;
+            uint16_t                                                                id_ = 0; ///< Server-assigned carrier-link id used by MUXON handshake; 0 means unassigned. Strand-affine.
+            uint64_t                                                                last_active_ = 0; ///< Tick of the most recent inbound frame on this link; turbo's approximate "best link" signal (recency, NOT RTT). Strand-affine.
+            int                                                                     inflight_ = 0;    ///< In-flight async writes issued on this link and not yet completed. Strand-affine. Used by runtime link removal (turbo dynamic pool): a link is only retired once inflight_ reaches 0 so a late write completion never touches a retired link's scheduling state.
+            bool                                                                    retiring_ = false; ///< Set when this link is being drained for runtime removal; it stops receiving new frames and is removed once inflight_ hits 0. Strand-affine.
         }                                                                           vmux_linklayer;
 
         typedef std::shared_ptr<vmux_linklayer>                                     vmux_linklayer_ptr;
@@ -113,9 +117,9 @@ namespace vmux {
          * @note All fields are in host byte order within the vmux subsystem;
          *       callers must not apply htonl/ntohs unless crossing a protocol boundary.
          */
-        typedef struct 
+        typedef struct
 #if defined(__GNUC__) || defined(__clang__)
-            __attribute__((packed)) 
+            __attribute__((packed))
 #endif
         {
             uint32_t                                                                seq;           ///< Frame sequence number used for ordered delivery.
@@ -138,6 +142,7 @@ namespace vmux {
             cmd_fin,                      ///< FIN — close the logical connection gracefully.
             cmd_keep_alived,              ///< KEEP-ALIVE — heartbeat probe frame.
             cmd_acceleration,             ///< ACCELERATION — enable/disable fast-path flag.
+            cmd_mux_mode_set,             ///< MUX-MODE-SET — debug-only request to switch the peer's scheduler mode.
             cmd_max,                      ///< Sentinel — one past the last valid command.
 
             max_buffers_size = UINT16_MAX - sizeof(vmux_hdr), ///< Maximum payload bytes per vmux frame.
@@ -170,7 +175,53 @@ namespace vmux {
         typedef vmux::list<tx_packet>                                               tx_packet_ssqueue;
         typedef vmux::map_pr<uint32_t, rx_packet, packet_less<uint32_t>>            rx_packet_ssqueue;
 
+        /**
+         * @brief Per-connection receive ordering context (flow v2).
+         *
+         * Holds one connection's independent DSN delivery state: the next
+         * expected per-flow DSN, a bounded reorder buffer keyed by DSN, the
+         * tick the oldest buffered frame was queued (gap timeout base), the
+         * current buffered byte total (memory bound), a priming flag, and a
+         * fin-seen flag used to release the context after the FIN is delivered.
+         */
+        struct flow_rx_context {
+            uint32_t                                                                flow_rx_next_         = 0;     ///< Next expected per-flow DSN.
+            rx_packet_ssqueue                                                       flow_reorder_;                ///< Bounded reorder buffer keyed by DSN (packet_less handles wraparound).
+            uint64_t                                                                oldest_buffered_tick_ = 0;     ///< Tick the oldest buffered frame was queued; 0 = no active gap timer.
+            size_t                                                                  buffered_bytes_       = 0;     ///< Sum of buffered frame lengths (memory bound).
+            bool                                                                    primed_               = false; ///< True once flow_rx_next_ has been initialized from the first frame.
+            bool                                                                    fin_seen_             = false; ///< True once a cmd_fin has been delivered for this connection.
+        };
+
         typedef vmux::unordered_map<uint32_t, vmux_skt_ptr>                         vmux_skt_map;
+        typedef vmux::unordered_map<uint32_t, flow_rx_context>                      vmux_flow_map;
+    public:
+        enum mux_mode {
+            mux_mode_compat  = 0,
+            mux_mode_flow    = 1,
+            mux_mode_balance = 2,
+            mux_mode_stripe  = 3,
+        };
+
+        /**
+         * @brief Negotiated receiver-side ordering mode (flow v2).
+         *
+         * ordering_compat keeps the existing single global tx_seq_/rx_ack_
+         * delivery (today's behavior). ordering_flow_v2 delivers each
+         * connection independently (per-flow DSN) so one slow link cannot
+         * head-of-line block other connections. Negotiated via the MUX frame's
+         * ordering_caps byte; defaults to compat and never upgrades unless both
+         * peers explicitly agree.
+         */
+        enum receiver_ordering_mode {
+            ordering_compat  = 0,
+            ordering_flow_v2 = 1,
+        };
+
+        /** @brief MUX capability bit advertised in the handshake (bit0 = FLOW_V2). */
+        enum {
+            ordering_caps_flow_v2 = 0x01,
+        };
 
     public:
         /**
@@ -181,7 +232,7 @@ namespace vmux {
          * @param server_mode true for server-side role.
          * @param acceleration true to enable acceleration by default.
          */
-        vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration) noexcept;
+        vmux_net(const ContextPtr& context, const StrandPtr strand, uint16_t max_connections, bool server_mode, bool acceleration, mux_mode mode = mux_mode_compat) noexcept;
         /** @brief Destroy the session and release all managed resources. */
         ~vmux_net() noexcept;
 
@@ -190,10 +241,76 @@ namespace vmux {
         const ContextPtr&                                                           get_context()         noexcept { return context_; }
         uint16_t                                                                    get_max_connections() noexcept { return status_.max_connections; }
         uint64_t                                                                    get_last()            noexcept { return status_.last_; }
+        mux_mode                                                                    get_mode()            noexcept { return mode_; }
+        /** @brief Current absolute carrier-link ceiling (turbo dynamic pool). */
+        uint16_t                                                                    get_pool_hard_max()   noexcept { return status_.pool_hard_max; }
+        /** @brief Raise the carrier-link ceiling for turbo before establishment.
+         *  @param hard_max New ceiling; clamped to be >= max_connections. No-op after
+         *         establishment (the base/ceiling are fixed once links are built). */
+        void                                                                        set_pool_hard_max(uint16_t hard_max) noexcept;
+        /**
+         * @brief Consume the turbo controller's pending "add N carrier links" request.
+         * @return Number of links the exchanger should connect+ConnectMux+add now
+         *         through add_linklayer's established-session path. Resets the
+         *         pending counter to 0.
+         * @note Strand-affine; called by the client exchanger's periodic mux pump.
+         */
+        int                                                                         take_turbo_pending_grow() noexcept;
+        static mux_mode                                                             parse_mode(const ppp::string& mode) noexcept;
+        /** @brief Map a wire mode byte to a valid scheduler mode (unknown -> compat). */
+        static mux_mode                                                             parse_mode_byte(Byte mode_value) noexcept;
+        static const char*                                                          mode_name(mux_mode mode) noexcept;
+        /** @brief Switch the active scheduler mode at runtime (strand-affine). */
+        void                                                                        set_mode(mux_mode mode) noexcept;
+        /** @brief Returns the negotiated receiver-side ordering mode. */
+        receiver_ordering_mode                                                      get_ordering_mode()   noexcept { return ordering_mode_; }
+        /**
+         * @brief Set the negotiated receiver ordering mode (flow v2).
+         * @param m Negotiated mode.
+         * @note Only takes effect before the session is established; a call
+         *       after establishment is a no-op (no hot compat<->flow-v2 switch).
+         */
+        void                                                                        set_ordering_mode(receiver_ordering_mode m) noexcept;
+        /** @brief True for session-level control frames (keep-alive / mux-mode-set). */
+        static bool                                                                 is_session_control(Byte cmd) noexcept {
+            return cmd == cmd_keep_alived || cmd == cmd_mux_mode_set;
+        }
+        /** @brief True for connection-level control frames (syn / syn-ok / acceleration). */
+        static bool                                                                 is_connection_control(Byte cmd) noexcept {
+            return cmd == cmd_syn || cmd == cmd_syn_ok || cmd == cmd_acceleration;
+        }
+        /** @brief True for per-flow data frames carrying a per-connection DSN (push / fin). */
+        static bool                                                                 is_per_flow_data(Byte cmd) noexcept {
+            return cmd == cmd_push || cmd == cmd_fin;
+        }
+        /**
+         * @brief True when this scheduler configuration uses negotiated per-flow
+         *        receiver ordering (flow v2 / per-flow DSN).
+         * @details balance spreads one session's frames across links by competition
+         *          (any free link sends any frame) and relies on the receiver
+         *          reordering each connection independently by per-flow DSN, so
+         *          cross-link reordering is not mistaken for loss. stripe (legacy,
+         *          experimental) likewise needs per-flow reordering. flow only needs
+         *          it when turbo is enabled, so turbo can add best-link-first and
+         *          prewarmed carriers without reintroducing cross-flow HoL blocking.
+         */
+        static bool                                                                 mode_requires_flow_v2(mux_mode mode, bool turbo) noexcept {
+            return mode == mux_mode_balance || mode == mux_mode_stripe || (mode == mux_mode_flow && turbo);
+        }
+        static bool                                                                 mode_requires_flow_v2(mux_mode mode) noexcept {
+            return mode_requires_flow_v2(mode, false);
+        }
+        /**
+         * @brief Push a debug-only mux-mode change request to the peer.
+         * @param mode  Desired scheduler mode for the remote endpoint.
+         * @return true when the control frame was queued for transmit.
+         * @note No-op unless a non-empty `mux.debug.key` is configured locally.
+         */
+        bool                                                                        post_mux_mode_set(mux_mode mode) noexcept;
         const uint32_t&                                                             get_tx_seq()          noexcept { return status_.tx_seq_; }
         const uint32_t&                                                             get_rx_ack()          noexcept { return status_.rx_ack_; }
-        bool                                                                        is_disposed()         noexcept { return base_.disposed_; }
-        bool                                                                        is_established()      noexcept { return !base_.disposed_ && base_.established_; }
+        bool                                                                        is_disposed()         noexcept { return base_.disposed_.load(std::memory_order_acquire); }
+        bool                                                                        is_established()      noexcept { return !base_.disposed_.load(std::memory_order_acquire) && base_.established_; }
 
         /** @brief Handle fast transport training/control frame. */
         bool                                                                        ftt(uint32_t seq, uint32_t ack) noexcept;
@@ -216,14 +333,39 @@ namespace vmux {
             const vmux_native_add_linklayer_after_success_before_callback&          cb) noexcept;
 
         /**
+         * @brief Begin retiring one carrier link at runtime (turbo dynamic pool
+         *        shrink, C-B4). Strand-affine.
+         * @return true when a link was marked for retirement.
+         * @details Picks the least-recently-active non-retiring link, marks it
+         *          retiring_ and removes it from tx_links_ so it takes no new frames.
+         *          The link object stays in rx_links_ until its in-flight writes
+         *          drain to 0, at which point reap_retired_linklayers() disposes it.
+         *          Never retires below max_connections (the base must always stand).
+         */
+        bool                                                                        retire_linklayer_runtime() noexcept;
+        /** @brief Dispose links that finished retiring (inflight_ == 0). Strand-affine; called from update(). */
+        void                                                                        reap_retired_linklayers() noexcept;
+        /**
+         * @brief Turbo pool controller step (C-B5). Strand-affine; called from update().
+         * @param now Current tick.
+         * @details Derives a target pool size from link quality (a recency/backlog
+         *          proxy — worse quality => larger pool, per the design) within
+         *          [max_connections, pool_hard_max], then moves the live pool one
+         *          step toward it (grow via turbo_pending_grow_ for the exchanger to
+         *          act on; shrink via retire_linklayer_runtime), rate-limited by a
+         *          cooldown for hysteresis. No-op unless turbo is on.
+         */
+        void                                                                        turbo_controller_tick(uint64_t now) noexcept;
+
+        /**
          * @brief Connect to a remote host and return logical vmux socket.
          */
         bool                                                                        connect_yield(
             ppp::coroutines::YieldContext&                                          y,
-            const ContextPtr&                                                       context, 
+            const ContextPtr&                                                       context,
             const StrandPtr&                                                        strand,
-            const std::shared_ptr<boost::asio::ip::tcp::socket>&                    sk, 
-            const template_string&                                                  host, 
+            const std::shared_ptr<boost::asio::ip::tcp::socket>&                    sk,
+            const template_string&                                                  host,
             int                                                                     port,
             const std::shared_ptr<vmux_skt_ptr>&                                    return_connection) noexcept;
 
@@ -286,12 +428,26 @@ namespace vmux {
         /** @brief Route inbound payload to target logical connection. */
         void                                                                        packet_input_read(uint32_t connection_id, Byte* buffer, int buffer_size, uint64_t now) noexcept;
 
+        /** @brief Validate and apply a debug-only cmd_mux_mode_set control frame. */
+        void                                                                        packet_input_mux_mode_set(const Byte* buffer, int buffer_size) noexcept;
+
+        /** @brief Per-flow (flow v2) receive path: independent per-connection DSN delivery. */
+        bool                                                                        packet_input_flow(const vmux_linklayer_ptr& linklayer, vmux_hdr* h, int length, uint64_t now) noexcept;
+        /** @brief Deliver one framed packet (push/fin) to its logical connection. */
+        bool                                                                        deliver_one(Byte cmd, vmux_hdr* h, int length, uint64_t now) noexcept;
+        /** @brief Periodically advance per-flow contexts whose gap timed out. */
+        void                                                                        flow_evict_expired(uint64_t now) noexcept;
+        /** @brief Skip the current gap of one flow and replay contiguous buffered frames. */
+        void                                                                        flow_force_advance(uint32_t connection_id, flow_rx_context& fx, uint64_t now) noexcept;
+        /** @brief Release a flow context once its FIN was delivered and buffer drained. */
+        void                                                                        maybe_release_flow(uint32_t connection_id, flow_rx_context& fx) noexcept;
+
         /** @brief Process SYN request and create connecting vmux socket state. */
         bool                                                                        process_rx_connecting(std::shared_ptr<vmux_skt>& skt, uint32_t connection_id, const char* host, int host_size) noexcept;
 
         /** @brief Refresh activity timestamp when session is alive. */
         void                                                                        active(uint64_t now) noexcept { 
-            if (!base_.disposed_) {
+            if (!base_.disposed_.load(std::memory_order_acquire)) {
                 status_.last_ = now; 
             }
         }
@@ -324,6 +480,53 @@ namespace vmux {
         bool                                                                        post_internal(Byte cmd, const void* packet, int packet_length, uint32_t connection_id, bool acceleration, const PostInternalAsynchronousCallback& posted_ac) noexcept;
         /** @brief Enqueue prebuilt vmux framed packet. */
         bool                                                                        post_internal(const std::shared_ptr<Byte>& packet, int packet_length, bool acceleration, const PostInternalAsynchronousCallback& posted_ac) noexcept;
+        /** @brief True when an underlying link-layer endpoint is usable. */
+        static bool                                                                 is_linklayer_active(const vmux_linklayer_ptr& linklayer) noexcept;
+        /** @brief Pick or refresh the primary link-layer endpoint for flow mode. */
+        vmux_linklayer_ptr                                                          select_primary_linklayer() noexcept;
+        /** @brief Pick a least-loaded active link-layer (balance link selection). */
+        vmux_linklayer_ptr                                                          select_balanced_linklayer() noexcept;
+        /** @brief Pick the sticky link-layer bound to a connection, binding one if needed. */
+        vmux_linklayer_ptr                                                          select_affinity_linklayer(uint32_t connection_id) noexcept;
+        /** @brief Pick the next active link-layer round-robin (stripe distribution). */
+        vmux_linklayer_ptr                                                          select_striped_linklayer() noexcept;
+        /** @brief Pick the most-recently-active link for a turbo first packet.
+         *  @details Approximate "best link" by recency of inbound traffic
+         *           (last_active_), NOT RTT — a cheap signal that reuses existing
+         *           per-link activity with no extra control frames. Used only for a
+         *           new connection's first packet under turbo; the connection is NOT
+         *           bound to this link (later frames return to the competition pool). */
+        vmux_linklayer_ptr                                                          select_turbo_linklayer() noexcept;
+        /** @brief Return true when a carrier id is already assigned to another link. */
+        bool                                                                        linklayer_id_in_use(uint16_t id, const vmux_linklayer_ptr& except) noexcept;
+        /** @brief Allocate a non-zero carrier id in [1, pool_hard_max], reusing retired ids. */
+        uint16_t                                                                    allocate_linklayer_id(const vmux_linklayer_ptr& linklayer) noexcept;
+        /** @brief Read the connection_id stored in a queued vmux frame buffer. */
+        static uint32_t                                                             peek_connection_id(const std::shared_ptr<Byte>& packet, int packet_length) noexcept;
+
+        /** @brief Drain queued transmit packets using the legacy scheduler. */
+        bool                                                                        process_tx_compat_packets() noexcept;
+        /** @brief Drain the high-priority control-frame queue first (flow v2).
+         *  @return false on a hard send failure, true otherwise.
+         *  @details Control frames (syn/syn_ok/acceleration/keep_alived/mux_mode_set)
+         *           carry seq=0 under flow v2 and are delivered inline by the
+         *           receiver (not DSN-gated), so they may be sent ahead of data on
+         *           any free link. This keeps new-connection setup and heartbeats
+         *           alive even when tx_queue_ is backlogged. No-op under compat,
+         *           where global ordering forbids reordering control ahead of data. */
+        bool                                                                        process_tx_ctrl_packets() noexcept;
+        /** @brief Drain queued transmit packets through one primary link. */
+        bool                                                                        process_tx_flow_packets() noexcept;
+        /** @brief Drain queued transmit packets using the competition scheduler
+         *  for balance mode. Identical send-side policy to compat (any free link
+         *  sends the next queued frame — no per-connection binding); the difference
+         *  is that balance negotiates per-flow receiver ordering (flow v2) so each
+         *  connection is reordered independently on receive, removing cross-flow
+         *  head-of-line blocking without pinning connections to links. */
+        bool                                                                        process_tx_balance_packets() noexcept;
+        /** @brief Drain queued transmit packets striped round-robin across links. */
+        bool                                                                        process_tx_stripe_packets() noexcept;
+
         
         /** @brief Drain all queued transmit packets to available link layers. */
         bool                                                                        process_tx_all_packets() noexcept;
@@ -332,6 +535,8 @@ namespace vmux {
 
         /** @brief Get one active underlying virtual-ethernet connection. */
         VirtualEthernetTcpipConnectionPtr                                           get_linklayer() noexcept;
+        /** @brief Remove one link-layer endpoint from scheduling tables. */
+        void                                                                        remove_linklayer(const vmux_linklayer_ptr& linklayer) noexcept;
 
         /** @brief Validate and post outgoing connect request command. */
         bool                                                                        connect_require(
@@ -357,17 +562,29 @@ namespace vmux {
     private:
         /** @brief Core boolean state flags for vmux session lifecycle. */
         struct {
-            bool                                                                    disposed_          : 1; ///< Set when session is finalized.
             bool                                                                    ftt_               : 1; ///< Fast transport training frame received.
             bool                                                                    established_       : 1; ///< At least one link-layer is established.
             bool                                                                    server_or_client_  : 1; ///< true = server role; false = client role.
             bool                                                                    acceleration_      : 4; ///< Acceleration enabled flags (multi-bit).
+
+            /**
+             * @brief Session-finalized flag (atomic).
+             *
+             * Read from multiple threads (the per-link forwarding strands, the
+             * vmux strand drain, and send/read completion callbacks) and written
+             * by finalize(). Kept as a standalone std::atomic<bool> — NOT a
+             * bit-field — so the teardown guard has a well-defined happens-before
+             * and writing it never read-modify-writes the neighbouring flags.
+             */
+            std::atomic<bool>                                                       disposed_;             ///< Set when session is finalized.
         }                                                                           base_;
 
         /** @brief Runtime counters, sequence values, and heartbeat timestamps. */
         struct {
-            uint16_t                                                                max_connections    = 0; ///< Maximum allowed logical connections.
-            uint16_t                                                                opened_connections = 0; ///< Currently active logical connection count.
+            uint16_t                                                                max_connections    = 0; ///< Initial/established carrier-link target (= --tun-mux base). Established fires at this count; unchanged on the wire.
+            uint16_t                                                                pool_hard_max      = 0; ///< Absolute upper bound on carrier links (turbo dynamic pool). Equals max_connections when turbo is off; base*factor when on. add_linklayer quota uses this.
+            uint16_t                                                                pool_current       = 0; ///< Current runtime target pool size (turbo controller), in [max_connections, pool_hard_max]. Equals max_connections when turbo off.
+            uint16_t                                                                opened_connections = 0; ///< Successful base-pool handshakes used to mark initial establishment; runtime carrier ids are allocated from free slots, not by incrementing this counter.
 
             uint32_t                                                                rx_ack_            = 0; ///< Last acknowledged inbound sequence number.
             uint32_t                                                                tx_seq_            = 0; ///< Next outbound sequence number to use.
@@ -384,8 +601,27 @@ namespace vmux {
         StrandPtr                                                                   strand_;            ///< Serialized strand for vmux event loop.
         ContextPtr                                                                  context_;           ///< ASIO execution context.
 
-        tx_packet_ssqueue                                                           tx_queue_;          ///< Pending outbound packet queue.
+        tx_packet_ssqueue                                                           tx_queue_;          ///< Pending outbound data packet queue.
+        tx_packet_ssqueue                                                           tx_ctrl_queue_;     ///< High-priority control-frame queue (flow v2 only); drained before tx_queue_ so new-connection SYN / heartbeats are never starved by a data backlog.
         rx_packet_ssqueue                                                           rx_queue_;          ///< Out-of-order inbound packet reorder queue.
+
+        mux_mode                                                                    mode_               = mux_mode_compat; ///< Transmit scheduler policy.
+        vmux_linklayer_ptr                                                          primary_linklayer_; ///< Primary link used by flow mode.
+        bool                                                                        mux_mode_set_pushed_ = false; ///< One-shot guard for the debug mux-mode-set push.
+        vmux::unordered_map<uint32_t, vmux_linklayer_ptr>                           affinity_links_;    ///< connection_id -> sticky link-layer (balance mode).
+        size_t                                                                      stripe_cursor_ = 0; ///< Round-robin cursor over rx_links_ (stripe mode).
+
+        receiver_ordering_mode                                                      ordering_mode_ = ordering_compat; ///< Negotiated receiver ordering mode (flow v2).
+        vmux_flow_map                                                               flows_;             ///< connection_id -> per-flow receive context (flow v2 only).
+        vmux::unordered_map<uint32_t, uint32_t>                                     tx_flow_seq_;       ///< connection_id -> next per-flow DSN to send (flow v2 only).
+        size_t                                                                      flow_reorder_cap_bytes_ = 0; ///< Per-connection reorder buffer byte cap (from config).
+        uint64_t                                                                    flow_reorder_timeout_   = 0; ///< Per-connection gap wait timeout in ms (from config).
+        uint64_t                                                                    tx_backlog_since_       = 0; ///< Tick the data tx queue first stayed at/over high-water (0 = not backlogged); drives the D11 stall watchdog.
+        size_t                                                                      tx_queue_high_water_    = (size_t)PPP_MUX_TX_QUEUE_HIGH_WATER; ///< Data tx-queue high-water depth (from config; D11 backpressure).
+        uint64_t                                                                    tx_backlog_stall_ms_    = (uint64_t)PPP_MUX_TX_BACKLOG_STALL_TIMEOUT; ///< Backlog stall timeout in ms (from config; D11 watchdog).
+        bool                                                                        turbo_                  = false; ///< flow-mode turbo enabled (from config; best-link-first first packet).
+        uint64_t                                                                    turbo_last_adjust_      = 0;     ///< Tick of the last turbo pool grow/shrink step (cooldown base).
+        int                                                                         turbo_pending_grow_     = 0;     ///< Carrier links the turbo controller wants the exchanger to add (consumed by client DoMuxEvents). Strand-affine.
 
         vmux_linklayer_vector                                                       rx_links_;          ///< All link-layer endpoints available for inbound.
         vmux_linklayer_list                                                         tx_links_;          ///< Link-layer endpoints ordered by transmit usage.

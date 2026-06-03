@@ -547,7 +547,7 @@ namespace ppp {
                  * @param y                Coroutine yield context.
                  * @return true if handled; false to close the session.
                  */
-                virtual bool                                                            OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, YieldContext& y) noexcept override;
+                virtual bool                                                            OnMux(const ITransmissionPtr& transmission, uint16_t vlan, uint16_t max_connections, bool acceleration, Byte ordering_caps, YieldContext& y) noexcept override;
 
             protected:
                 /**
@@ -838,6 +838,12 @@ namespace ppp {
                  * @return true if all sub-links were connected; false if any failed.
                  */
                 bool                                                                    MuxConnectAllLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux) noexcept;
+                /**
+                 * @brief Connect N extra carrier links at runtime and attach each via
+                 *        add_linklayer's established-session path (turbo dynamic pool grow).
+                 * @return true when the grow coroutine was spawned.
+                 */
+                bool                                                                    MuxGrowLinklayers(const std::shared_ptr<ppp::threading::BufferswapAllocator>& allocator, const std::shared_ptr<vmux::vmux_net>& mux, int count) noexcept;
 
             private:
                 /**

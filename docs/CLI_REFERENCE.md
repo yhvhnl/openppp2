@@ -263,6 +263,96 @@ ppp --mode=client -c=./client.json --tun-mux=4
 MUX acceleration mode. Controls how the multiplexed connections distribute traffic.
 Valid values depend on the build configuration.
 
+### `--mux-mode=<compat|flow|balance|stripe>`
+
+MUX scheduler mode. `compat` / `flow` / `balance` send by **competition** (any
+linklayer with send credit takes the next queued frame — no per-connection binding,
+which would risk load imbalance and degenerate to a single TCP under several heavy
+flows). `stripe` is the experimental exception: it prefers round-robin per-packet
+distribution, with busy-link fallback. Modes differ in receiver-side ordering and intent.
+`flow` with turbo, `balance`, and `stripe` add an optional MUX capability byte for
+flow-v2 negotiation.
+Configure both peers consistently.
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `compat` | Original upstream behavior: competition send + single global sequence/ack ordering on receive. One connection's gap head-of-line blocks all connections. | Default / rollback / regression baseline. |
+| `flow` | Latency-oriented direction: competition send + global ordering. Optional `--mux-mode-turbo` layers best-link-first first-packet, prewarmed carrier links, and negotiated per-flow DSN on top for first-byte responsiveness without cross-flow HoL blocking or per-connection binding. | Interactive / web / latency-sensitive use. |
+| `balance` | Competition send + **negotiated per-flow receiver ordering (flow v2)**: each connection is reordered independently by per-flow DSN, so a slow/blocked connection only head-of-line blocks itself, not the others — while every link stays fully and adaptively utilized (no binding). | Many concurrent connections wanting throughput with per-flow isolation. |
+| `stripe` | Experimental: round-robin per-packet distribution + per-flow ordering. | Future pseudo-MPTCP / 9000-MTU work. |
+
+> **`flow+turbo`, `balance`, and `stripe` negotiate per-flow ordering and need both ends on a supporting
+> build.** Negotiation is an intersection; against an older peer the session falls back to
+> `compat` global ordering (no regression, no per-flow benefit). The trade-off of per-flow
+> ordering is that a connection's own frames may arrive out of order across links and wait
+> in a bounded reorder buffer up to `mux.flow.reorder.timeout`.
+>
+> **`stripe` caveat (experimental):** striping one flow across links of different speeds
+> causes heavy intra-connection reordering and can be *worse* than `compat`/`flow`. It is a
+> base for future per-link sequencing work, not a fast path today.
+
+Set `mux.mode` in JSON or pass `--mux-mode=flow` at startup (CLI overrides JSON).
+
+**Default:** `compat`
+
+### `--mux-mode-turbo=[yes|no]`
+
+flow-mode turbo (opt-in, default `no`; only meaningful under `--mux-mode=flow`). It sends
+a new connection's first packet over the most-recently-active carrier link (an approximate
+"best link" by recency of inbound traffic — **not** an RTT measurement; it reuses existing
+per-link activity and adds no control frames) to cut first-byte latency. The connection is
+**not** bound to that link — every later frame returns to the normal competition pool.
+
+Turbo also negotiates flow-v2 per-flow DSN when both peers support it, so a delayed frame
+from one connection does not globally head-of-line block unrelated connections while the
+extra carrier pool is active. It opens and retires extra carrier TCP links at runtime to
+widen the competition pool when backlog indicates poor quality. The original `--tun-mux`
+value remains the base pool size; turbo raises only the runtime carrier ceiling and does
+not add per-connection binding or rebuild the mux session. Set `mux.turbo` in JSON or pass
+`--mux-mode-turbo=yes`.
+
+**Default:** `no`
+
+### `--debug-key=<secret>` and `--mux-mode-set=<compat|flow|balance|stripe>`
+
+Debug-only remote control of the peer's scheduler mode. This is opt-in and intended for
+testing on jittery links, not for production.
+
+- `--debug-key=<secret>` sets a shared secret. Remote mux-mode control is **disabled
+  unless this key is non-empty on the receiving side**. Configure the **same** key on
+  both client and server.
+- `--mux-mode-set=<compat|flow|balance|stripe>` asks the *other* endpoint to switch its
+  scheduler mode. The request is sent once, after the mux session is established, over the
+  existing encrypted vmux transport (a new `cmd_mux_mode_set` control frame; no new
+  per-packet header field).
+
+The receiver applies the change only when its own `--debug-key` is non-empty and matches
+the key carried in the frame (compared in constant time). A missing key, a mismatched
+key, or a malformed frame is logged and ignored — the session is never torn down, so a
+forged frame cannot disrupt traffic.
+
+The pushed mode is **sticky on the receiver**: it is recorded as a runtime override and
+survives mux session rebuilds (link flap, idle/heartbeat timeout, reconnect), so it does
+not silently revert to the configured `mux.mode` on the next reconnect. It is not written
+to disk and resets to the configured value when the receiver process restarts.
+
+You can also set the key in JSON as `mux.debug.key`. The `--mux-mode-set` request itself
+is transient (CLI only) and is never written back to the configuration file.
+
+> **Compatibility:** the `cmd_mux_mode_set` control frame is only emitted when both
+> `--debug-key` and `--mux-mode-set` are set. Both peers must run a build that
+> understands this frame; sending it to an older peer that predates the feature will be
+> treated as an invalid command and drop that mux session. Only use it when both ends run
+> a matching build.
+
+```
+# server (allows remote control, same key as client)
+ppp --mode=server -c=./server.json --debug-key=lab-secret
+
+# client (push the server to flow mode at runtime for an A/B test)
+ppp --mode=client -c=./client.json --tun-mux=8 --debug-key=lab-secret --mux-mode-set=flow
+```
+
 ### `--tun-promisc=[yes|no]`
 
 Promiscuous mode on Linux and macOS. When `yes`, the virtual NIC accepts all frames
@@ -532,6 +622,9 @@ The bottom status row is split into two columns (roughly 60/40):
 | `--tun-host` | `yes` |
 | `--rt` | `yes` |
 | `--tun-mux` | `0` (disabled) |
+| `--mux-mode` | `compat` |
+| `--debug-key` | (disabled) |
+| `--mux-mode-set` | (off) |
 
 ---
 

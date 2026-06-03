@@ -174,6 +174,15 @@ void PppApplication::GetEnvironmentInformationLines(ppp::vector<ppp::string>& li
         if (std::shared_ptr<AppConfiguration> configuration = configuration_; NULLPTR != configuration) {
             AppendEnvLine(lines, "Public IP", configuration->ip.public_);
             AppendEnvLine(lines, "Interface IP", configuration->ip.interface_);
+
+            // Server advertises its preferred/allowed scheduler mode; per-session
+            // ordering is negotiated with each client (see OnMux). Show the
+            // configured preferred mode here (not a per-session live value).
+            ppp::string mux_mode_text = configuration->GetEffectiveMuxMode();
+            if (configuration->mux.turbo) {
+                mux_mode_text += "+turbo";
+            }
+            AppendEnvLine(lines, "Mux Mode", mux_mode_text);
         }
 
         using NAC = VirtualEthernetSwitcher::NetworkAcceptorCategories;
@@ -299,6 +308,16 @@ void PppApplication::GetEnvironmentInformationLines(ppp::vector<ppp::string>& li
                         mux_state += ", ";
                         mux_state += stl::to_string<ppp::string>(client->Mux(NULLPTR));
                         mux_state += "-channel";
+
+                        // Real-time scheduler mode in effect on the client (includes any
+                        // runtime --mux-mode-set override). Turbo is shown when enabled.
+                        if (NULLPTR != configuration_) {
+                            mux_state += ", mode=";
+                            mux_state += configuration_->GetEffectiveMuxMode();
+                            if (configuration_->mux.turbo) {
+                                mux_state += "+turbo";
+                            }
+                        }
                     } else {
                         mux_state = "none";
                     }

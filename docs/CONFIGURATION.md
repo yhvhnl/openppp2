@@ -75,7 +75,7 @@ After `Loaded()`, `main.cpp` reads CLI arguments and applies host-specific overr
 | `ip` | Public and interface IP declarations |
 | `udp` | UDP socket policy, DNS, relay timeouts |
 | `tcp` | TCP socket policy, connect/inactive timeouts |
-| `mux` | MUX (multiplexing) channel parameters |
+| `mux` | MUX channel timeouts, keepalive, and scheduler mode |
 | `websocket` | WebSocket carrier configuration |
 | `key` | Protocol/transport cipher and obfuscation flags |
 | `vmem` | Virtual memory-backed file behavior |
@@ -93,7 +93,7 @@ graph TD
     CFG --> IP["ip\n(public_ip, interface_ip)"]
     CFG --> UDP["udp\n(timeout, dns, port, static)"]
     CFG --> TCP["tcp\n(listen, connect, inactive, turbo, fast-open)"]
-    CFG --> MUX["mux\n(timeout, keepalive)"]
+    CFG --> MUX["mux\n(timeout, keepalive, mode)"]
     CFG --> WS["websocket\n(host, path, listen, ssl, headers)"]
     CFG --> KEY["key\n(kf,kh,kl,kx,sb, protocol, transport,\nmasked, delta_encode, shuffle_data)"]
     CFG --> VMEM["vmem\n(path, size)"]
@@ -181,8 +181,17 @@ Contains TCP socket policy:
 Controls multiplexing channel behavior:
 - `mux.connect.timeout` — timeout for MUX sub-connection establishment.
 - `mux.inactive.timeout` — idle timeout for MUX sub-connections.
-- `mux.keepalive.timeout` — MUX keepalive interval.
-- `mux.max-connections` — maximum number of parallel MUX sub-connections per session.
+- `mux.mode` — scheduler mode (`compat` | `flow` | `balance` | `stripe`). `compat`, `flow`, and `balance` send by competition (any free link takes the next frame; no per-connection binding); `stripe` prefers round-robin per-packet distribution with busy-link fallback. `compat` is the original upstream behavior (global ordering). `flow` is latency-oriented (global ordering unless paired with `mux.turbo`). `balance` adds negotiated per-flow receiver ordering (flow v2) so a connection only head-of-line blocks itself. `stripe` is experimental. An unrecognized value normalizes to `compat` with a non-fatal startup warning.
+- `mux.turbo` — flow-mode turbo (default false): best-link-first first packet plus prewarmed carrier links to widen the competition pool, with negotiated per-flow DSN when both peers support flow v2. Only meaningful under `mux.mode=flow`. CLI: `--mux-mode-turbo=[yes|no]`.
+- `mux.flow.reorder.bytes` — per-connection reorder buffer byte cap under flow v2 (strictly > 0; default 1048576). Bounds receiver memory: when a connection's buffered out-of-order bytes would exceed this, the oldest gap is skipped (the lost bytes are recovered by the tunneled TCP).
+- `mux.flow.reorder.timeout` — per-connection gap wait timeout in milliseconds under flow v2 (strictly > 0; default 400, near link RTT). If a missing frame does not arrive within this window, the gap is skipped so delivery does not stall.
+- `mux.tx.queue.max` — data transmit-queue high-water depth in frames (strictly > 0; default 4096). At/above it the acceleration read-pump is throttled (re-coupled to send completion) so the queue cannot grow unbounded when the carrier stalls. Control frames (SYN/heartbeat) use a separate priority queue and are never throttled.
+- `mux.tx.queue.stall` — milliseconds the data transmit-queue may stay backlogged (at/over high-water) before the session is torn down and rebuilt (strictly > 0; default 8000). Recovers a wedged session that cannot self-heal instead of hanging dead to new connections.
+- `mux.debug.key` — optional shared secret for debug-only remote scheduler control. When non-empty and identical on both peers, a peer may push a mode change via the `--mux-mode-set` CLI flag. Empty (default) disables remote control. The `--mux-mode-set` request is CLI-only and is never persisted to JSON.
+- `mux.keep-alived` — MUX keepalive interval range `[min, max]`, in seconds.
+- `mux.congestions` — MUX congestion window budget.
+
+The number of parallel MUX sub-connections is still selected by the runtime `--tun-mux=<connections>` flag, not by a `mux.max-connections` JSON key.
 
 ### `websocket`
 
@@ -492,8 +501,9 @@ The configuration decides the shape of the runtime:
   "mux": {
     "connect": { "timeout": 15 },
     "inactive": { "timeout": 300 },
-    "keepalive": { "timeout": 60 },
-    "max-connections": 8
+    "congestions": 134217728,
+    "mode": "compat",
+    "keep-alived": [5, 20]
   },
   "websocket": {
     "host": "",
