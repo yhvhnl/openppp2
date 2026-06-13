@@ -19,7 +19,7 @@
 #else
 #include <net/if.h>
 #include <net/route.h>
-#include <linux/if.h>
+//#include <linux/if.h>
 #include <linux/if_tun.h>
 #endif
 
