@@ -62,6 +62,7 @@ void PppApplication::PrintHelpInformation() noexcept {
 
     ppp::ConsoleFormat("Version:      %s\n", PPP_APPLICATION_VERSION);
     ppp::ConsoleWrite("Copyright:    (C) 2017 ~ 2055 SupersocksR ORG. All rights reserved.\n");
+    ppp::ConsoleFormat("Compiled by:  HaoyuLi (From source code) \r\n");
     ppp::ConsoleFormat("Current Dir:  %s\n\n", cwd.data());
 
     ppp::ConsoleWrite("USAGE:\n");
