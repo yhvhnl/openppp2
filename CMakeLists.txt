@@ -135,12 +135,12 @@ TARGET_LINK_LIBRARIES(${NAME}
     -static-libgcc
     -static-libstdc++
 
-    ${CMAKE_THREAD_LIBS_INIT} # -lpthread (在 -static 下会自动寻找 libpthread.a)
-    dl                        # libdl
-    rt                        # librt
+    ${CMAKE_THREAD_LIBS_INIT} 
+    dl                        
+    rt                        
 
-    lzma                      # 必须补在这里，解决 libunwind 的 lzma 依赖
-    z                         # 补上 zlib 依赖
+    lzma                      
+    z                         
 
     -static
 )
