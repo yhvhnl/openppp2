@@ -1,0 +1,85 @@
+name: Build OpenPPP2 for EPYC Genoa (PPP Branch)
+
+on:
+  push:
+    branches:
+      - ppp  
+  workflow_dispatch: 
+
+env:
+  OPENSSL_SERIES: "3.5"  
+  DEBIAN_FRONTEND: noninteractive
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake libjemalloc-dev libboost-all-dev \
+            libunwind-dev wget perl tar xz-utils bzip2 gzip git
+
+      - name: Precise Linker Adjustments 
+        run: |
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libunwind.so*
+          sudo rm -f /usr/lib/gcc/x86_64-linux-gnu/*/libatomic.so*
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libjemalloc.so*
+          
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.a
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.a
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.so
+
+      - name: Fetch and Compile Latest Custom OpenSSL
+        run: |
+          echo "=== 开始处理 OpenSSL ==="
+          echo "目标大版本系列: $OPENSSL_SERIES"
+          
+          ESCAPED_SERIES=$(echo "${OPENSSL_SERIES}" | sed 's/\./\\./g')
+          VERSION=$(git ls-remote --tags https://github.com/openssl/openssl.git | awk -F'/' '{print $3}' | grep -E "^openssl-${ESCAPED_SERIES}\.[0-9]+$" | sed 's/openssl-//' | sort -V | tail -n1)
+          
+          if [ -z "$VERSION" ]; then
+            echo "错误: 找不到任何匹配大版本系列 $OPENSSL_SERIES 的 OpenSSL 官方发布版本！"
+            exit 1
+          fi
+          echo "成功匹配并锁定最新版本号: $VERSION"
+          
+          wget "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz"
+          tar -zxf "openssl-${VERSION}.tar.gz"
+          
+          cd "openssl-${VERSION}"
+          ./config no-shared --prefix=/usr/local --openssldir=/usr/local/ssl -march=x86-64-v3 -msha -O3
+          make -j$(nproc)
+          sudo make install_sw
+          
+          cd ..
+          rm -rf "openssl-${VERSION}" "openssl-${VERSION}.tar.gz"
+          echo "=== OpenSSL $VERSION 静态库安装成功 ==="
+
+      - name: Configure and Compile OpenPPP2
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPPP_FORCE_STATIC=ON \
+            -DOPENSSL_ROOT_DIR=/usr/local \
+            -DCMAKE_C_FLAGS="-march=x86-64-v3 -msha -O3" \
+            -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -msha -O3"
+            
+          make -j$(nproc)
+          strip ./ppp
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openppp2-ubuntu-24.04-simd
+          path: build/ppp
