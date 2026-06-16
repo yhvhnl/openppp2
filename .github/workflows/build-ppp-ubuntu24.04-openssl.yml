@@ -1,13 +1,13 @@
-name: Build OpenPPP2 with Custom OpenSSL (PPP Branch)
+name: Build OpenPPP2 Universal High-Performance (PPP Branch)
 
 on:
   push:
     branches:
-      - ppp  
-  workflow_dispatch: 
+      - ppp
+  workflow_dispatch:
 
 env:
-  OPENSSL_SERIES: "3.5"  
+  OPENSSL_SERIES: "3.5"
   DEBIAN_FRONTEND: noninteractive
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -57,7 +57,7 @@ jobs:
           tar -zxf "openssl-${VERSION}.tar.gz"
           
           cd "openssl-${VERSION}"
-          ./config no-shared --prefix=/usr/local --openssldir=/usr/local/ssl
+          ./config no-shared --prefix=/usr/local --openssldir=/usr/local/ssl -O3
           make -j$(nproc)
           sudo make install_sw
           
@@ -68,12 +68,18 @@ jobs:
       - name: Configure and Compile OpenPPP2
         run: |
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DPPP_FORCE_STATIC=ON -DOPENSSL_ROOT_DIR=/usr/local
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPPP_FORCE_STATIC=ON \
+            -DOPENSSL_ROOT_DIR=/usr/local \
+            -DCMAKE_C_FLAGS="-O3" \
+            -DCMAKE_CXX_FLAGS="-O3"
+            
           make -j$(nproc)
           strip ./ppp
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openppp2-ubuntu-24.04-bin
+          name: ppp-ubuntu-24.04-openssl
           path: build/ppp
