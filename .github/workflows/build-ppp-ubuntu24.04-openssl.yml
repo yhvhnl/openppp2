@@ -5,20 +5,15 @@ on:
     branches:
       - ppp  
   workflow_dispatch: 
-    inputs:
-      openssl_series:
-        description: 'OpenSSL 大版本号系列 (例如: 3.5 或 4.0)'
-        required: true
-        default: '3.5'
+
+env:
+  OPENSSL_SERIES: "3.5"  
+  DEBIAN_FRONTEND: noninteractive
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      OPENSSL_SERIES: ${{ github.event.inputs.openssl_series || '3.5' }}
 
     steps:
       - name: Checkout Code
@@ -38,8 +33,11 @@ jobs:
           sudo rm -f /usr/lib/x86_64-linux-gnu/libunwind.so*
           sudo rm -f /usr/lib/gcc/x86_64-linux-gnu/*/libatomic.so*
           sudo rm -f /usr/lib/x86_64-linux-gnu/libjemalloc.so*
-          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.*
-          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.*
+          
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.a
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.a
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.so
 
       - name: Fetch and Compile Latest Custom OpenSSL
         run: |
