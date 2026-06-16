@@ -1,0 +1,60 @@
+name: Build OpenPPP2 (PPP Branch)
+
+on:
+  push:
+    branches:
+      - ppp  
+  workflow_dispatch: 
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive 
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libjemalloc-dev \
+            libboost-all-dev \
+            libunwind-dev \
+            libssl-dev \
+            wget \
+            perl \
+            tar \
+            xz-utils \
+            bzip2 \
+            gzip \
+            git
+
+      - name: Precise Linker Adjustments (物理超度)
+        run: |
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libunwind.so
+          sudo rm -f /usr/lib/gcc/x86_64-linux-gnu/*/libatomic.so || true
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libjemalloc.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libssl.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libcrypto.so
+
+      - name: Configure and Compile
+        run: |
+          mkdir -p build && cd build
+          cmake cmake .. -DCMAKE_BUILD_TYPE=Release -DPPP_FORCE_STATIC=ON
+          make -j$(nproc)
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openppp2-ubuntu-24.04-bin
+          path: |
+            build/
+            !build/**/*.o
