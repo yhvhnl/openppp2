@@ -8,10 +8,11 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 
 
     env:
       DEBIAN_FRONTEND: noninteractive
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true 
 
     steps:
       - name: Checkout Code
@@ -37,7 +38,7 @@ jobs:
             gzip \
             git
 
-      - name: Precise Linker Adjustments (物理超度)
+      - name: Precise Linker Adjustments 
         run: |
           sudo rm -f /usr/lib/x86_64-linux-gnu/libunwind.so
           sudo rm -f /usr/lib/gcc/x86_64-linux-gnu/*/libatomic.so || true
@@ -48,13 +49,12 @@ jobs:
       - name: Configure and Compile
         run: |
           mkdir -p build && cd build
-          cmake cmake .. -DCMAKE_BUILD_TYPE=Release -DPPP_FORCE_STATIC=ON
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DPPP_FORCE_STATIC=ON
           make -j$(nproc)
+          strip ./ppp
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: openppp2-ubuntu-24.04-bin
-          path: |
-            build/
-            !build/**/*.o
+          path: build/ppp  
