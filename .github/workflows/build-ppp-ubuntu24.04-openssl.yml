@@ -3,7 +3,7 @@ name: Build OpenPPP2 Universal High-Performance (PPP Branch)
 on:
   push:
     branches:
-      - ppp
+      - ppp.del
   workflow_dispatch:
 
 env:
