@@ -3,7 +3,7 @@ name: Build and Release PPP (Dynamic Customization)
 on:
   push:
     tags:
-      - 'v*' 
+      - 'v2*' 
 
 permissions:
   contents: write 
