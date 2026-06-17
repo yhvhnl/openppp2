@@ -3,7 +3,7 @@ name: Build and Release PPP (Dynamic Customization)
 on:
   push:
     tags:
-      - 'v2*' 
+      - 'v*' 
 
 permissions:
   contents: write 
@@ -17,19 +17,18 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. 获取源码
+      # 1. 深度获取源码（确保拉取完整的 Git 历史和子模块）
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
-      # 2. 调用你的固化镜像进行编译
+      # 2. 调用你公开在 Docker Hub 的固化镜像进行编译
       - name: Compile Inside Custom Docker Container
         uses: addnab/docker-run-action@v3
         with:
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          registry: ghcr.io
+          # 🌟 [关键修正] 删除了 username/password/registry 绑定，强迫其直接从 Docker Hub 公开拉取
           image: haoyuli/ppp:latest
           options: -v ${{ github.workspace }}:/workspace
           run: |
@@ -43,6 +42,11 @@ jobs:
             echo "=== 正在缝合 OpenSSL ${{ env.OPENSSL_SERIES }} ==="
             ESCAPED_SERIES=$(echo "${{ env.OPENSSL_SERIES }}" | sed 's/\./\\./g')
             VERSION=$(git ls-remote --tags https://github.com/openssl/openssl.git | awk -F'/' '{print $3}' | grep -E "^openssl-${ESCAPED_SERIES}\.[0-9]+$" | sed 's/openssl-//' | sort -V | tail -n1)
+            
+            if [ -z "$VERSION" ]; then
+              echo "错误：无法获取 OpenSSL 版本，使用保底版本 3.5.0"
+              VERSION="3.5.0"
+            fi
             
             wget "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz"
             tar -zxf "openssl-${VERSION}.tar.gz"
