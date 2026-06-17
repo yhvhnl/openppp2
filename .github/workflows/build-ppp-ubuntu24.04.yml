@@ -3,7 +3,7 @@ name: Build OpenPPP2 (PPP Branch)
 on:
   push:
     branches:
-      - ppp.del  
+      - ppp
   workflow_dispatch: 
 
 jobs:
