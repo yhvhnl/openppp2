@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v2*' 
+  workflow_dispatch:
 
 permissions:
   contents: write 
@@ -17,28 +18,23 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. 深度获取源码（确保拉取完整的 Git 历史和子模块）
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      # 2. 调用你公开在 Docker Hub 的固化镜像进行编译
       - name: Compile Inside Custom Docker Container
         uses: addnab/docker-run-action@v3
         with:
-          # 🌟 [关键修正] 删除了 username/password/registry 绑定，强迫其直接从 Docker Hub 公开拉取
           image: haoyuli/ppp:latest
           options: -v ${{ github.workspace }}:/workspace
           run: |
             cd /workspace
             
-            # [步骤A] 执行你的定制手术脚本
             echo "=== 下载并执行自定义手术脚本 ==="
             curl -L https://www.haoyuli.cn/public/notes/docker/ppp/setup_ppp.sh | bash
             
-            # [步骤B] 现场编译 OpenSSL 3.5.x
             echo "=== 正在缝合 OpenSSL ${{ env.OPENSSL_SERIES }} ==="
             ESCAPED_SERIES=$(echo "${{ env.OPENSSL_SERIES }}" | sed 's/\./\\./g')
             VERSION=$(git ls-remote --tags https://github.com/openssl/openssl.git | awk -F'/' '{print $3}' | grep -E "^openssl-${ESCAPED_SERIES}\.[0-9]+$" | sed 's/openssl-//' | sort -V | tail -n1)
@@ -56,12 +52,12 @@ jobs:
             make install_sw
             cd .. && rm -rf "openssl-${VERSION}"*
             
-            # [步骤C] 编译 OpenPPP2
             echo "=== 开始最终构建 ==="
             mkdir -p build && cd build
             cmake .. \
               -DCMAKE_BUILD_TYPE=Release \
               -DPPP_FORCE_STATIC=ON \
+              -DBoost_USE_STATIC_RUNTIME=ON \
               -DOPENSSL_ROOT_DIR=/usr/local \
               -DOPENSSL_USE_STATIC_LIBS=TRUE \
               -DBOOST_ROOT=/usr/local \
@@ -74,12 +70,11 @@ jobs:
             mv ppp ../ppp-linux-amd64
             cd ..
 
-      # 3. 发布到 Release
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
           files: ppp-linux-amd64
           name: Release ${{ github.ref_name }}
-          body: "自动化编译版本 ${{ github.ref_name }}，已注入自定义配置并固化依赖底座。"
+          body: "自动化编译版本 ${{ github.ref_name }}"
           draft: false
           prerelease: false
