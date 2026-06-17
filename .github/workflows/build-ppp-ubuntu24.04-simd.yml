@@ -3,7 +3,7 @@ name: Build OpenPPP2 for EPYC Genoa (PPP Branch)
 on:
   push:
     branches:
-      - ppp  
+      - ppp.del  
   workflow_dispatch: 
 
 env:
